@@ -75,38 +75,83 @@ class SlingSmuggler:
         self.config = config
         self.bypass = bypass
         self._seen_urls: Set[str] = set()
-        self._max_per_path = 25
+        self._max_per_path = 15  # Reduced from 25
+        self._max_total_requests = 200  # Hard cap per phase
+        self._request_count = 0
+        # Semaphore to limit concurrent requests within this module
+        self._semaphore = asyncio.Semaphore(min(20, config.max_concurrent))
+        # Track consecutive failures for early exit
+        self._consecutive_failures = 0
+        self._max_consecutive_failures = 30  # Abort path if 30 consecutive 403/404/0
     
     async def run(self, base_url: str) -> List[Finding]:
-        """Run the full Sling Smuggler permutation engine."""
+        """Run the full Sling Smuggler permutation engine with timeouts."""
         findings: List[Finding] = []
         
-        # Phase A: Content selector permutations on all target paths
-        selector_findings = await self._test_content_selectors(base_url)
-        findings.extend(selector_findings)
-        
-        # Phase B: Internal servlet switching
-        servlet_findings = await self._test_servlet_selectors(base_url)
-        findings.extend(servlet_findings)
-        
-        # Phase C: Dot-One trick mid-path insertion
-        dot_one_findings = await self._test_dot_one_trick(base_url)
-        findings.extend(dot_one_findings)
-        
-        # Phase D: Recursive selector chaining on discovered content
-        chain_findings = await self._recursive_selector_chain(base_url)
-        findings.extend(chain_findings)
+        try:
+            # Phase A: Content selector permutations (with 5 min timeout)
+            selector_findings = await asyncio.wait_for(
+                self._test_content_selectors(base_url),
+                timeout=300  # 5 minutes max
+            )
+            findings.extend(selector_findings)
+            
+            # Phase B: Internal servlet switching (with 3 min timeout)
+            servlet_findings = await asyncio.wait_for(
+                self._test_servlet_selectors(base_url),
+                timeout=180
+            )
+            findings.extend(servlet_findings)
+            
+            # Phase C: Dot-One trick (with 2 min timeout)
+            dot_one_findings = await asyncio.wait_for(
+                self._test_dot_one_trick(base_url),
+                timeout=120
+            )
+            findings.extend(dot_one_findings)
+            
+            # Phase D: Recursive chaining (with 3 min timeout)
+            chain_findings = await asyncio.wait_for(
+                self._recursive_selector_chain(base_url),
+                timeout=180
+            )
+            findings.extend(chain_findings)
+            
+        except asyncio.TimeoutError:
+            print(f"[Sling Smuggler] Timeout reached — returning {len(findings)} findings")
         
         return findings
     
     async def _test_content_selectors(self, base_url: str) -> List[Finding]:
-        """Test content extraction selectors on target paths."""
+        """Test content extraction selectors on target paths with early exit."""
         findings = []
+        self._request_count = 0
+        self._consecutive_failures = 0
         
         for path in self.TARGET_PATHS:
-            tested = 0
+            # Early exit if we're hitting walls
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                print(f"[Sling Smuggler] Too many consecutive failures, skipping remaining paths")
+                break
+            if self._request_count >= self._max_total_requests:
+                print(f"[Sling Smuggler] Request cap reached ({self._max_total_requests})")
+                break
+            
+            path_findings = await self._test_single_path_selectors(base_url, path)
+            findings.extend(path_findings)
+        
+        return findings
+    
+    async def _test_single_path_selectors(self, base_url: str, path: str) -> List[Finding]:
+        """Test selectors on a single path with per-path semaphore."""
+        findings = []
+        tested = 0
+        
+        async with self._semaphore:
             for selector in self.CONTENT_SELECTORS:
                 if tested >= self._max_per_path:
+                    break
+                if self._request_count >= self._max_total_requests:
                     break
                 
                 url = f"{base_url}{path}{selector}"
@@ -114,12 +159,20 @@ class SlingSmuggler:
                     continue
                 self._seen_urls.add(url)
                 tested += 1
+                self._request_count += 1
                 
+                # Use reduced bypass attempts (5 instead of 10)
                 response = await self.engine.get_with_bypass_fallback(
                     url, base_url, f"{path}{selector}",
                     bypass_transformer=self.bypass,
-                    max_bypass_attempts=10
+                    max_bypass_attempts=5
                 )
+                
+                # Track failures for early exit
+                if response.status_code in [401, 403, 404, 0]:
+                    self._consecutive_failures += 1
+                else:
+                    self._consecutive_failures = 0  # Reset on success
                 
                 if response.status_code == 200 and self._is_meaningful(response.text):
                     severity = self._assess_severity(path, selector, response.text)
@@ -135,7 +188,7 @@ class SlingSmuggler:
                             "path": path,
                             "response_size": len(response.text),
                             "sample": response.text[:500],
-                            "bypass_used": response.bypass_used,
+                            "bypass_used": getattr(response, 'bypass_used', None),
                         },
                         bypass_used=None,
                         chainable=True
@@ -144,44 +197,50 @@ class SlingSmuggler:
         return findings
     
     async def _test_servlet_selectors(self, base_url: str) -> List[Finding]:
-        """Test internal servlet switching selectors."""
+        """Test internal servlet switching selectors with limits."""
         findings = []
+        self._request_count = 0
         
-        for path in self.TARGET_PATHS:
-            tested = 0
-            for selector in self.SERVLET_SELECTORS:
-                if tested >= self._max_per_path:
-                    break
-                
-                url = f"{base_url}{path}{selector}"
-                if url in self._seen_urls:
-                    continue
-                self._seen_urls.add(url)
-                tested += 1
-                
-                response = await self.engine.get_with_bypass_fallback(
-                    url, base_url, f"{path}{selector}",
-                    bypass_transformer=self.bypass,
-                    max_bypass_attempts=10
-                )
-                
-                if response.status_code == 200 and self._is_meaningful(response.text):
-                    findings.append(Finding(
-                        phase=ScanPhase.DISCOVERY,
-                        technique="Sling Smuggler: Servlet Selector",
-                        url=response.url or url,
-                        severity=VulnSeverity.MEDIUM,
-                        title=f"Internal Servlet via {selector}: {path}",
-                        description=f"Servlet selector {selector} activates at {path}",
-                        evidence={
-                            "selector": selector,
-                            "path": path,
-                            "response_size": len(response.text),
-                            "sample": response.text[:500],
-                            "bypass_used": response.bypass_used,
-                        },
-                        chainable=True
-                    ))
+        for path in self.TARGET_PATHS[:8]:  # Limit to first 8 paths
+            if self._request_count >= self._max_total_requests // 2:
+                break
+            
+            async with self._semaphore:
+                tested = 0
+                for selector in self.SERVLET_SELECTORS[:10]:  # Limit selectors
+                    if tested >= 10 or self._request_count >= self._max_total_requests // 2:
+                        break
+                    
+                    url = f"{base_url}{path}{selector}"
+                    if url in self._seen_urls:
+                        continue
+                    self._seen_urls.add(url)
+                    tested += 1
+                    self._request_count += 1
+                    
+                    response = await self.engine.get_with_bypass_fallback(
+                        url, base_url, f"{path}{selector}",
+                        bypass_transformer=self.bypass,
+                        max_bypass_attempts=3  # Reduced from 10
+                    )
+                    
+                    if response.status_code == 200 and self._is_meaningful(response.text):
+                        findings.append(Finding(
+                            phase=ScanPhase.DISCOVERY,
+                            technique="Sling Smuggler: Servlet Selector",
+                            url=response.url or url,
+                            severity=VulnSeverity.MEDIUM,
+                            title=f"Internal Servlet via {selector}: {path}",
+                            description=f"Servlet selector {selector} activates at {path}",
+                            evidence={
+                                "selector": selector,
+                                "path": path,
+                                "response_size": len(response.text),
+                                "sample": response.text[:500],
+                                "bypass_used": getattr(response, 'bypass_used', None),
+                            },
+                            chainable=True
+                        ))
         
         return findings
     
@@ -240,18 +299,18 @@ class SlingSmuggler:
         return findings
     
     async def _recursive_selector_chain(self, base_url: str) -> List[Finding]:
-        """Recursively chain selectors to probe deeper into content trees.
-        
-        E.g. /content.1.json -> find children -> /content/child.1.json -> ...
-        """
+        """Recursively chain selectors with strict limits."""
         findings = []
         visited: Set[str] = set()
-        queue: List[Tuple[str, int]] = [(p, 0) for p in self.TARGET_PATHS[:8]]
+        queue: List[Tuple[str, int]] = [(p, 0) for p in self.TARGET_PATHS[:6]]  # Reduced from 8
+        max_queue_size = 50  # Prevent unbounded growth
+        requests_this_phase = 0
+        max_requests = 50  # Hard limit for this phase
         
-        while queue:
+        while queue and requests_this_phase < max_requests:
             path, depth = queue.pop(0)
             
-            if depth > 2 or path in visited:
+            if depth > 1 or path in visited:  # Reduced depth from 2 to 1
                 continue
             visited.add(path)
             
@@ -259,23 +318,25 @@ class SlingSmuggler:
             if url in self._seen_urls:
                 continue
             self._seen_urls.add(url)
+            requests_this_phase += 1
             
-            response = await self.engine.get(url)
+            async with self._semaphore:
+                response = await self.engine.get(url)
             
             if response.status_code == 200:
                 try:
                     data = json.loads(response.text)
                     if isinstance(data, dict):
-                        # Extract child node names for deeper probing
                         children = [
                             k for k in data.keys()
                             if not k.startswith("jcr:") and ":" not in k
                             and isinstance(data.get(k), dict)
                         ]
                         
-                        for child in children[:10]:
+                        # Limit queue size
+                        for child in children[:5]:  # Reduced from 10
                             child_path = f"{path}/{child}"
-                            if child_path not in visited:
+                            if child_path not in visited and len(queue) < max_queue_size:
                                 queue.append((child_path, depth + 1))
                         
                         if children and depth > 0:
@@ -285,14 +346,11 @@ class SlingSmuggler:
                                 url=url,
                                 severity=VulnSeverity.LOW,
                                 title=f"Deep Child Discovery: {path}",
-                                description=(
-                                    f"Recursive selector chain found {len(children)} "
-                                    f"children at depth {depth}"
-                                ),
+                                description=f"Found {len(children)} children at depth {depth}",
                                 evidence={
                                     "path": path,
                                     "depth": depth,
-                                    "children": children[:20],
+                                    "children": children[:10],  # Reduced from 20
                                     "child_count": len(children),
                                 },
                                 chainable=True
