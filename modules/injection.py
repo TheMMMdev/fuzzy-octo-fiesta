@@ -6,6 +6,7 @@ Tests for:
 - LFI (Local File Inclusion) via Sling selectors
 """
 
+import asyncio
 import json
 import re
 import urllib.parse
