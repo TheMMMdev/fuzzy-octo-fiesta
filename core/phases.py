@@ -458,15 +458,24 @@ class PhaseManager:
         self.phase3 = Phase3Exploitation(engine, config, self.bypass)
     
     async def run_all_phases(self, target_url: str) -> List[PhaseResult]:
-        """Execute all phases sequentially."""
+        """Execute all phases sequentially.
+        
+        If Phase 1 fails to detect an AEM instance, aborts remaining phases
+        to avoid sending thousands of requests to a non-AEM target.
+        """
         results = []
         
         # Phase 1: Fingerprinting
         p1_result = await self.phase1.execute(target_url)
         results.append(p1_result)
         
-        # Phase 2: Discovery (uses Phase 1 info)
+        # Check if we detected an AEM instance
         target_info = p1_result.target_info or TargetInfo(url=target_url)
+        if target_info.server_type is None and not p1_result.findings:
+            print("[!] No AEM instance detected — aborting scan to avoid unnecessary requests")
+            return results
+        
+        # Phase 2: Discovery (uses Phase 1 info)
         p2_result = await self.phase2.execute(target_url, target_info)
         results.append(p2_result)
         
