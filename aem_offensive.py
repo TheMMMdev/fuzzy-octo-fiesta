@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
-"""AEM Multi-Stage Offensive Security Framework
+"""Slingblade - AEM Offensive Security Framework
 
-Main entry point for the comprehensive AEM security assessment tool.
+A sharp tool for penetrating Adobe Experience Manager defenses.
+Multi-phase discovery, bypass techniques, and deep service probing.
 """
 
 import asyncio
 import sys
-import time
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
-from rich.panel import Panel
 from rich import box
+from rich.panel import Panel
 
-# Import core components
 from core.config import AEMConfig
 from core.engine import HTTPXEngine
-from core.models import ScanResult, TargetInfo, ServerType
+from core.models import ScanResult, TargetInfo
 from core.phases import PhaseManager
 from bypass.transformers import BypassTransformer
 
@@ -39,11 +37,11 @@ from reporting.attack_graph import ReportGenerator
 
 # Version info
 __version__ = "1.0.0"
-__author__ = "AEM Offensive Framework"
+__author__ = "Slingblade Security Framework"
 
 app = typer.Typer(
-    name="aem-offensive",
-    help="Advanced AEM Multi-Stage Offensive Security Framework",
+    name="slingblade",
+    help="Slingblade — AEM Offensive Security Framework",
     add_completion=False
 )
 
@@ -51,18 +49,16 @@ console = Console()
 
 
 def print_banner():
-    """Print the tool banner."""
-    banner = (
-        "[bold red]    _   ________  __  __________  ______  ______\n"
-        "   / | / /  _/  |/  /  _/ __ \\\\ \\\\/ / __ \\\\/ ____/\n"
-        "  /  |/ // // /|_/ // // /_/ /\\\\  / / / / __/   \n"
-        " / /|  // // /  / // // _, _/ / / /_/ / /___   \n"
-        "/_/ |_/___/_/  /_/___/_/ |_| /_/\\\\____/_____/   \n"
-        "                                               \n"
-        f"[bold yellow]Multi-Stage Offensive Security Framework v{__version__}[/bold yellow]\n"
-        "[dim]Advanced AEM Vulnerability Assessment & Exploitation Tool[/dim]"
-    )
-    console.print(banner)
+    """Print the Slingblade banner."""
+    console.print("")
+    console.print("[bold red]    ╔═══════════════════════════════════════════════════════════╗[/bold red]")
+    console.print("[bold red]    ║[/bold red]                                                           [bold red]║[/bold red]")
+    console.print("[bold red]    ║[/bold red]              [bold white]SLINGBLADE[/bold white]                                  [bold red]║[/bold red]")
+    console.print("[bold red]    ║[/bold red]                                                           [bold red]║[/bold red]")
+    console.print("[bold red]    ╚═══════════════════════════════════════════════════════════╝[/bold red]")
+    console.print(f"[bold yellow]         AEM Offensive Security Framework v{__version__}[/bold yellow]")
+    console.print("[dim]         Apache Sling / OSGi / JCR Exploitation Toolkit[/dim]")
+    console.print("")
 
 
 def validate_url(url: str) -> str:
@@ -107,62 +103,80 @@ async def run_scan(target_url: str, config: AEMConfig) -> ScanResult:
                 result.findings.extend(phase_result.findings)
                 if phase_result.target_info:
                     result.target_info = phase_result.target_info
+                # Check for abort after phases
+                if engine.should_abort:
+                    print("[yellow]Scan aborted due to excessive failures[/yellow]")
+                    break
             
             # JCR Probing Module
-            if config.enable_jcr_probe:
+            if config.enable_jcr_probe and not engine.should_abort:
                 task = progress.add_task("[green]Probing JCR resources...", total=None)
                 jcr_module = JCRProbingModule(engine, config)
                 jcr_findings = await jcr_module.run(target_url)
                 result.findings.extend(jcr_findings)
                 progress.remove_task(task)
+                if engine.should_abort:
+                    print("[yellow]Scan aborted due to excessive failures[/yellow]")
             
             # OSGi Exploitation Module
-            if config.enable_osgi_exploit:
+            if config.enable_osgi_exploit and not engine.should_abort:
                 task = progress.add_task("[yellow]Testing OSGi exploitation...", total=None)
                 osgi_module = OSGiExploitationModule(engine, config, bypass)
                 osgi_findings = await osgi_module.run(target_url)
                 result.findings.extend(osgi_findings)
                 progress.remove_task(task)
+                if engine.should_abort:
+                    print("[yellow]Scan aborted due to excessive failures[/yellow]")
             
             # Injection Testing Module
-            if config.enable_injection:
+            if config.enable_injection and not engine.should_abort:
                 task = progress.add_task("[red]Testing injection vectors...", total=None)
                 injection_module = InjectionTestingModule(engine, config)
                 injection_findings = await injection_module.run(target_url)
                 result.findings.extend(injection_findings)
                 progress.remove_task(task)
+                if engine.should_abort:
+                    print("[yellow]Scan aborted due to excessive failures[/yellow]")
             
             # CVE Suite Module
-            if config.enable_cve_suite:
+            if config.enable_cve_suite and not engine.should_abort:
                 task = progress.add_task("[magenta]Running CVE checks...", total=None)
                 cve_module = CVESuiteModule(engine, config, bypass)
                 cve_findings = await cve_module.run(target_url)
                 result.findings.extend(cve_findings)
                 progress.remove_task(task)
+                if engine.should_abort:
+                    print("[yellow]Scan aborted due to excessive failures[/yellow]")
             
             # Sling Smuggler Module
-            if config.enable_sling_smuggler:
+            if config.enable_sling_smuggler and not engine.should_abort:
                 task = progress.add_task("[blue]Running Sling Smuggler permutations...", total=None)
                 smuggler = SlingSmuggler(engine, config, bypass)
                 smuggler_findings = await smuggler.run(target_url)
                 result.findings.extend(smuggler_findings)
                 progress.remove_task(task)
+                if engine.should_abort:
+                    print("[yellow]Scan aborted due to excessive failures[/yellow]")
             
             # JCR Inference Engine Module
-            if config.enable_jcr_inference:
+            if config.enable_jcr_inference and not engine.should_abort:
                 task = progress.add_task("[cyan]Running JCR Inference Engine...", total=None)
                 inference = JCRInferenceEngine(engine, config, bypass)
                 inference_findings = await inference.run(target_url)
                 result.findings.extend(inference_findings)
                 progress.remove_task(task)
+                if engine.should_abort:
+                    print("[yellow]Scan aborted due to excessive failures[/yellow]")
             
             # Service Probe Module
-            if config.enable_service_probe:
+            if config.enable_service_probe and not engine.should_abort:
                 task = progress.add_task("[white]Probing AEM services...", total=None)
                 service_probe = ServiceProbeModule(engine, config, bypass)
                 service_findings = await service_probe.run(target_url)
                 result.findings.extend(service_findings)
                 progress.remove_task(task)
+                if engine.should_abort:
+                    print("[yellow]Scan aborted due to excessive failures[/yellow]")
     
     # Calculate end time
     result.end_time = datetime.utcnow()
@@ -383,7 +397,7 @@ def wordlist(
 @app.command()
 def version():
     """Show version information."""
-    console.print(f"[bold]AEM Offensive Framework[/bold] v{__version__}")
+    console.print(f"[bold]Slingblade[/bold] v{__version__}")
     console.print(f"[dim]{__author__}[/dim]")
 
 

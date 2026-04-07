@@ -71,6 +71,8 @@ class AdaptiveRateLimiter:
 class HTTPXEngine:
     """Async HTTP engine using httpx with HTTP/2 support."""
     
+    MAX_CONSECUTIVE_FAILURES = 50  # Global abort threshold
+    
     def __init__(self, config: AEMConfig):
         self.config = config
         self.rate_limiter = AdaptiveRateLimiter(
@@ -87,6 +89,33 @@ class HTTPXEngine:
             "rate_limited": 0,
             "errors": 0
         }
+        self.consecutive_failures = 0
+        self._abort_scan = False
+    
+    @property
+    def should_abort(self) -> bool:
+        """Check if scan should abort due to too many consecutive failures."""
+        return self._abort_scan or self.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES
+    
+    def _record_request_result(self, status_code: int, is_error: bool = False):
+        """Record request result and track consecutive failures."""
+        if is_error or status_code == 0:
+            # Connection error or timeout
+            self.consecutive_failures += 1
+        elif status_code >= 500:
+            # Server error (5xx) — count as failure
+            self.consecutive_failures += 1
+        elif status_code in [401, 403, 404]:
+            # Expected HTTP responses — don't count as failure
+            pass
+        else:
+            # Success (2xx) or client error (4xx other than 401/403/404)
+            self.consecutive_failures = 0
+        
+        # Check if we should abort
+        if self.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+            self._abort_scan = True
+            print(f"[!] ABORTING SCAN: {self.consecutive_failures} consecutive failures. Target appears unresponsive.")
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -163,6 +192,9 @@ class HTTPXEngine:
                 if response.status_code < 400:
                     self.stats["successful"] += 1
             
+            # Track consecutive failures
+            self._record_request_result(response.status_code)
+            
             return ResponseWrapper(
                 status_code=response.status_code,
                 headers=dict(response.headers),
@@ -175,6 +207,8 @@ class HTTPXEngine:
             
         except httpx.RequestError as e:
             self.stats["errors"] += 1
+            # Track consecutive failures
+            self._record_request_result(0, is_error=True)
             return ResponseWrapper(
                 status_code=0,
                 headers={},

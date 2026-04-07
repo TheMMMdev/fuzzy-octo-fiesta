@@ -24,6 +24,7 @@ class PhaseResult:
     findings: List[Finding] = field(default_factory=list)
     target_info: Optional[TargetInfo] = None
     new_paths: Set[str] = field(default_factory=set)
+    blocked_paths: Set[str] = field(default_factory=set)  # Paths that returned 403
 
 
 class Phase1Fingerprinting:
@@ -202,6 +203,7 @@ class Phase2Discovery:
         self.config = config
         self.bypass = bypass
         self.discovered_paths: Set[str] = set()
+        self.blocked_paths: Set[str] = set()  # Track 403 responses
     
     async def execute(self, base_url: str, target_info: TargetInfo) -> PhaseResult:
         """Execute discovery phase."""
@@ -220,7 +222,8 @@ class Phase2Discovery:
         return PhaseResult(
             phase=ScanPhase.DISCOVERY,
             findings=findings,
-            new_paths=self.discovered_paths
+            new_paths=self.discovered_paths,
+            blocked_paths=self.blocked_paths
         )
     
     async def _enumerate_path(
@@ -247,6 +250,10 @@ class Phase2Discovery:
             
             # Auto-bypass on block
             if response.status_code in [401, 403, 404]:
+                # Track blocked path for Phase 3
+                if response.status_code in [401, 403]:
+                    self.blocked_paths.add(path)
+                
                 response = await self.engine.get_with_bypass_fallback(
                     url, base_url, f"{path}{selector}",
                     bypass_transformer=self.bypass,
@@ -367,23 +374,23 @@ class Phase3Exploitation:
         self, 
         base_url: str, 
         target_info: TargetInfo,
-        discovered_paths: Set[str]
+        discovered_paths: Set[str],
+        blocked_paths: Set[str] = None
     ) -> PhaseResult:
         """Execute exploitation phase."""
         print(f"[Phase 3] Exploitation phase with bypass rotation")
         
         findings: List[Finding] = []
+        blocked_paths = blocked_paths or set()
         
-        # Try bypasses on blocked patterns
+        # Try bypasses on Phase 1 blocked patterns
         for blocked_path in target_info.blocked_patterns:
             bypass_findings = await self._try_bypasses(base_url, blocked_path)
             findings.extend(bypass_findings)
         
-        # Also try bypasses on discovered paths that returned 403
-        for path in discovered_paths:
-            url = f"{base_url}{path}"
-            response = await self.engine.get(url)
-            if response.status_code in [401, 403]:
+        # Try bypasses on Phase 2 blocked paths (no redundant GET needed)
+        for path in blocked_paths:
+            if path not in target_info.blocked_patterns:  # Skip if already tried
                 bypass_findings = await self._try_bypasses(base_url, path)
                 findings.extend(bypass_findings)
         
@@ -481,7 +488,10 @@ class PhaseManager:
         
         # Phase 3: Exploitation (uses Phase 1 & 2 data)
         all_discovered = p1_result.new_paths | p2_result.new_paths
-        p3_result = await self.phase3.execute(target_url, target_info, all_discovered)
+        phase2_blocked = getattr(p2_result, 'blocked_paths', set())
+        p3_result = await self.phase3.execute(
+            target_url, target_info, all_discovered, phase2_blocked
+        )
         results.append(p3_result)
         
         return results
