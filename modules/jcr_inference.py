@@ -11,7 +11,7 @@ import asyncio
 import json
 from typing import List, Dict, Set, Optional
 
-from core.models import Finding, VulnSeverity, ScanPhase
+from core.models import Finding, VulnSeverity, ScanPhase, BypassTechnique
 from core.config import AEMConfig
 from core.engine import HTTPXEngine
 from bypass.transformers import BypassTransformer
@@ -19,6 +19,15 @@ from bypass.transformers import BypassTransformer
 
 class JCRInferenceEngine:
     """JCR property guessing, virtual folder scanning, and safe depth probing."""
+    
+    def _get_bypass_enum(self, response) -> Optional[BypassTechnique]:
+        """Convert response bypass string to BypassTechnique enum."""
+        if response.bypass_used:
+            try:
+                return BypassTechnique(response.bypass_used)
+            except ValueError:
+                pass
+        return None
     
     # Properties to probe via QueryBuilder
     SENSITIVE_PROPERTIES: List[str] = [
@@ -131,6 +140,25 @@ class JCRInferenceEngine:
         
         return findings
     
+    def _is_valid_querybuilder_response(self, text: str) -> bool:
+        """Check if response is actual QueryBuilder API (not login page)."""
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                has_hits = "hits" in data and isinstance(data.get("hits"), list)
+                has_total = "total" in data and isinstance(data.get("total"), int)
+                has_results = "results" in data and isinstance(data.get("results"), int)
+                
+                if has_hits or has_total or has_results:
+                    # Reject auth pages
+                    text_lower = text.lower()
+                    if any(x in text_lower for x in ["login", "password", "j_password"]):
+                        return False
+                    return True
+        except json.JSONDecodeError:
+            pass
+        return False
+    
     async def _querybuilder_property_inference(self, base_url: str) -> List[Finding]:
         """Probe for hidden JCR properties via QueryBuilder API."""
         findings = []
@@ -143,7 +171,7 @@ class JCRInferenceEngine:
             max_bypass_attempts=15
         )
         
-        if qb_response.status_code != 200:
+        if qb_response.status_code != 200 or qb_response.is_soft_404:
             # Try alternate endpoints
             alt_endpoints = [
                 "/bin/querybuilder.json.servlet",
@@ -153,10 +181,12 @@ class JCRInferenceEngine:
             for alt in alt_endpoints:
                 alt_url = f"{base_url}{alt}"
                 qb_response = await self.engine.get(alt_url)
-                if qb_response.status_code == 200:
+                if qb_response.status_code == 200 and not qb_response.is_soft_404 and self._is_valid_querybuilder_response(qb_response.text):
                     break
         
-        qb_accessible = qb_response.status_code == 200
+        qb_accessible = (qb_response.status_code == 200 and 
+                         not qb_response.is_soft_404 and 
+                         self._is_valid_querybuilder_response(qb_response.text))
         
         if not qb_accessible:
             return findings
@@ -168,7 +198,8 @@ class JCRInferenceEngine:
             severity=VulnSeverity.MEDIUM,
             title="QueryBuilder API Accessible",
             description="QueryBuilder JSON endpoint is reachable",
-            evidence={"status": qb_response.status_code},
+            evidence={"status": qb_response.status_code, "sample": qb_response.text[:200], "bypass_technique": qb_response.bypass_used},
+            bypass_used=self._get_bypass_enum(qb_response),
             chainable=True
         ))
         
@@ -184,7 +215,7 @@ class JCRInferenceEngine:
                 
                 response = await self.engine.get(probe_url)
                 
-                if response.status_code == 200:
+                if response.status_code == 200 and not response.is_soft_404 and self._is_valid_querybuilder_response(response.text):
                     try:
                         data = json.loads(response.text)
                         hits = data.get("hits", [])
@@ -233,7 +264,7 @@ class JCRInferenceEngine:
                     max_bypass_attempts=10
                 )
                 
-                if response.status_code == 200 and self._has_jcr_content(response.text):
+                if response.status_code == 200 and not response.is_soft_404 and self._has_jcr_content(response.text):
                     findings.append(Finding(
                         phase=ScanPhase.DISCOVERY,
                         technique="JCR Inference: Virtual Folder",
@@ -249,8 +280,9 @@ class JCRInferenceEngine:
                             "selector": selector,
                             "response_size": len(response.text),
                             "sample": response.text[:500],
-                            "bypass_used": response.bypass_used,
+                            "bypass_technique": response.bypass_used,
                         },
+                        bypass_used=self._get_bypass_enum(response),
                         chainable=True
                     ))
                     break  # Found working selector for this folder
@@ -279,7 +311,7 @@ class JCRInferenceEngine:
                     max_bypass_attempts=5
                 )
                 
-                if response.status_code == 200:
+                if response.status_code == 200 and not response.is_soft_404:
                     try:
                         data = json.loads(response.text)
                         if isinstance(data, dict):

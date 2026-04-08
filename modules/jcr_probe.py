@@ -86,20 +86,26 @@ class JCRProbingModule:
                 url = f"{base_url}{path}{selector}"
                 response = await self.engine.get(url)
                 
-                if response.status_code == 200:
+                if response.status_code == 200 and not response.is_soft_404:
                     try:
                         data = json.loads(response.text)
-                        
-                        # Calculate severity based on selector type
-                        severity = VulnSeverity.MEDIUM
-                        if "infinity" in selector:
-                            severity = VulnSeverity.CRITICAL
-                        elif selector in [".1.json", ".2.json"]:
-                            severity = VulnSeverity.HIGH
                         
                         # Analyze content
                         node_count = self._count_nodes(data)
                         sensitive_props = self._find_sensitive_props(data)
+                        
+                        # Skip findings with 0 accessible nodes (not impactful)
+                        if node_count == 0 and not sensitive_props:
+                            continue
+                        
+                        # Calculate severity based on selector type and content
+                        severity = VulnSeverity.MEDIUM
+                        if "infinity" in selector:
+                            severity = VulnSeverity.CRITICAL
+                        elif selector in [".1.json", ".2.json"] and node_count > 0:
+                            severity = VulnSeverity.HIGH
+                        elif node_count == 0:
+                            severity = VulnSeverity.LOW
                         
                         findings.append(Finding(
                             phase=ScanPhase.DISCOVERY,
@@ -142,7 +148,7 @@ class JCRProbingModule:
             url = f"{base_url}{variant}"
             response = await self.engine.get(url)
             
-            if response.status_code == 200:
+            if response.status_code == 200 and not response.is_soft_404:
                 content_type = response.headers.get("content-type", "")
                 
                 # Check for interesting content
@@ -180,7 +186,7 @@ class JCRProbingModule:
             url = f"{base_url}{path}"
             response = await self.engine.get(url)
             
-            if response.status_code == 200:
+            if response.status_code == 200 and not response.is_soft_404:
                 try:
                     data = json.loads(response.text)
                     
@@ -227,6 +233,29 @@ class JCRProbingModule:
         
         return findings
     
+    def _is_querybuilder_response(self, text: str) -> bool:
+        """Check if response is actual QueryBuilder JSON (not login page)."""
+        try:
+            data = json.loads(text)
+            # QueryBuilder responses have specific structure
+            if isinstance(data, dict):
+                # Must have hits array or success flag
+                has_hits = "hits" in data and isinstance(data.get("hits"), list)
+                has_success = data.get("success") == True
+                has_total = "total" in data and isinstance(data.get("total"), int)
+                has_results = "results" in data and isinstance(data.get("results"), int)
+                
+                if has_hits or has_success or has_total or has_results:
+                    # Verify it's not an error/auth response
+                    text_lower = text.lower()
+                    auth_indicators = ["login", "sign in", "password", "j_password", "auth"]
+                    if any(auth in text_lower for auth in auth_indicators):
+                        return False
+                    return True
+        except json.JSONDecodeError:
+            pass
+        return False
+    
     async def _probe_querybuilder(self, base_url: str) -> List[Finding]:
         """Probe QueryBuilder for information leakage."""
         findings = []
@@ -235,7 +264,8 @@ class JCRProbingModule:
         # Test basic querybuilder access
         basic_test = await self.engine.get(qb_endpoint)
         
-        if basic_test.status_code == 200:
+        # Verify it's actual QueryBuilder response, not 200 OK with login page
+        if basic_test.status_code == 200 and not basic_test.is_soft_404 and self._is_querybuilder_response(basic_test.text):
             findings.append(Finding(
                 phase=ScanPhase.DISCOVERY,
                 technique="QueryBuilder Exposure",
@@ -243,7 +273,7 @@ class JCRProbingModule:
                 severity=VulnSeverity.HIGH,
                 title="QueryBuilder Endpoint Accessible",
                 description="/bin/querybuilder.json is accessible without authentication",
-                evidence={"status": basic_test.status_code}
+                evidence={"status": basic_test.status_code, "sample": basic_test.text[:200]}
             ))
         
         # Try complex queries to extract information
@@ -258,23 +288,25 @@ class JCRProbingModule:
             url = f"{base_url}{query_url}"
             response = await self.engine.get(url)
             
-            if response.status_code == 200:
+            if response.status_code == 200 and not response.is_soft_404 and self._is_querybuilder_response(response.text):
                 try:
                     data = json.loads(response.text)
                     hits = data.get("hits", [])
+                    total = data.get("total", 0) or data.get("results", 0)
                     
-                    if len(hits) > 0:
+                    # Only report if we actually got data back
+                    if len(hits) > 0 or total > 0:
                         findings.append(Finding(
                             phase=ScanPhase.DISCOVERY,
                             technique="QueryBuilder Data Leak",
                             url=url,
                             severity=VulnSeverity.HIGH,
                             title=f"QueryBuilder Leaks {desc}",
-                            description=f"QueryBuilder query returned {len(hits)} results for {desc}",
+                            description=f"QueryBuilder query returned {len(hits) or total} results for {desc}",
                             evidence={
                                 "query": query_url,
-                                "result_count": len(hits),
-                                "sample_results": hits[:5]
+                                "result_count": len(hits) or total,
+                                "sample_results": hits[:5] if hits else []
                             },
                             chainable=True
                         ))

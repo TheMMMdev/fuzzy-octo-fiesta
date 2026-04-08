@@ -12,7 +12,7 @@ import json
 from typing import List, Dict, Set, Optional, Tuple
 from itertools import product
 
-from core.models import Finding, VulnSeverity, ScanPhase
+from core.models import Finding, VulnSeverity, ScanPhase, BypassTechnique
 from core.config import AEMConfig
 from core.engine import HTTPXEngine
 from bypass.transformers import BypassTransformer
@@ -20,6 +20,15 @@ from bypass.transformers import BypassTransformer
 
 class SlingSmuggler:
     """Advanced Sling path & selector permutation engine."""
+    
+    def _get_bypass_enum(self, response) -> Optional[BypassTechnique]:
+        """Convert response bypass string to BypassTechnique enum."""
+        if hasattr(response, 'bypass_used') and response.bypass_used:
+            try:
+                return BypassTechnique(response.bypass_used)
+            except ValueError:
+                pass
+        return None
     
     # Deep selectors for content extraction
     CONTENT_SELECTORS: List[str] = [
@@ -52,6 +61,10 @@ class SlingSmuggler:
         ".img.png",
         ".thumb.png",
         ".renditions.json",
+        ".blueprint.json",
+        ".languages.json",
+        ".caconfig.json",
+        ".contextaware.json",
     ]
     
     # "Dot-One" trick patterns — insert mid-path selectors
@@ -68,6 +81,10 @@ class SlingSmuggler:
         "/libs/granite", "/libs/cq", "/apps",
         "/bin/querybuilder.json", "/bin/wcm",
         "/system/console", "/crx/de",
+        "/api/assets", "/content/dam/_jcr_content",
+        "/etc/replication/_jcr_content", "/etc/cloudservices/_jcr_content",
+        "/libs/granite/security/currentuser",
+        "/conf/global", "/content/experience-fragments",
     ]
     
     def __init__(self, engine: HTTPXEngine, config: AEMConfig, bypass: BypassTransformer):
@@ -174,7 +191,7 @@ class SlingSmuggler:
                 else:
                     self._consecutive_failures = 0  # Reset on success
                 
-                if response.status_code == 200 and self._is_meaningful(response.text):
+                if response.status_code == 200 and not response.is_soft_404 and self._is_meaningful(response.text):
                     severity = self._assess_severity(path, selector, response.text)
                     findings.append(Finding(
                         phase=ScanPhase.DISCOVERY,
@@ -188,9 +205,9 @@ class SlingSmuggler:
                             "path": path,
                             "response_size": len(response.text),
                             "sample": response.text[:500],
-                            "bypass_used": getattr(response, 'bypass_used', None),
+                            "bypass_technique": getattr(response, 'bypass_used', None),
                         },
-                        bypass_used=None,
+                        bypass_used=self._get_bypass_enum(response),
                         chainable=True
                     ))
         
@@ -224,7 +241,7 @@ class SlingSmuggler:
                         max_bypass_attempts=3  # Reduced from 10
                     )
                     
-                    if response.status_code == 200 and self._is_meaningful(response.text):
+                    if response.status_code == 200 and not response.is_soft_404 and self._is_meaningful(response.text):
                         findings.append(Finding(
                             phase=ScanPhase.DISCOVERY,
                             technique="Sling Smuggler: Servlet Selector",
@@ -237,8 +254,9 @@ class SlingSmuggler:
                                 "path": path,
                                 "response_size": len(response.text),
                                 "sample": response.text[:500],
-                                "bypass_used": getattr(response, 'bypass_used', None),
+                                "bypass_technique": getattr(response, 'bypass_used', None),
                             },
+                            bypass_used=self._get_bypass_enum(response),
                             chainable=True
                         ))
         
@@ -275,7 +293,7 @@ class SlingSmuggler:
                     
                     response = await self.engine.get(full_url)
                     
-                    if response.status_code == 200 and self._is_meaningful(response.text):
+                    if response.status_code == 200 and not response.is_soft_404 and self._is_meaningful(response.text):
                         findings.append(Finding(
                             phase=ScanPhase.EXPLOITATION,
                             technique="Sling Smuggler: Dot-One Trick",
@@ -323,7 +341,7 @@ class SlingSmuggler:
             async with self._semaphore:
                 response = await self.engine.get(url)
             
-            if response.status_code == 200:
+            if response.status_code == 200 and not response.is_soft_404:
                 try:
                     data = json.loads(response.text)
                     if isinstance(data, dict):

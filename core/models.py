@@ -35,6 +35,8 @@ class BypassTechnique(str, Enum):
     CASE_SENSITIVITY = "case_sensitivity"
     SEMICOLON_GAP = "semicolon_gap"
     PATH_OVERLAP = "path_overlap"
+    SLING_SUFFIX = "sling_suffix"
+    JCR_CONTENT = "jcr_content"
 
 
 class ScanPhase(str, Enum):

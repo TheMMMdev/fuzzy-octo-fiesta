@@ -1,10 +1,11 @@
 """Async HTTP engine with adaptive rate limiting for AEM Offensive Framework."""
 
 import asyncio
+import hashlib
 import random
 import time
 from typing import Any, Dict, Optional, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 from core.config import AEMConfig, DEFAULT_HEADERS, USER_AGENTS, X_FORWARDED_IPS
@@ -21,6 +22,7 @@ class ResponseWrapper:
     elapsed: float
     bypass_used: Optional[str] = None
     technique: Optional[str] = None
+    is_soft_404: bool = False
 
 
 class AdaptiveRateLimiter:
@@ -73,6 +75,9 @@ class HTTPXEngine:
     
     MAX_CONSECUTIVE_FAILURES = 50  # Global abort threshold
     
+    # Common soft-404 URL patterns
+    SOFT_404_URL_PATTERNS = ["/404", "/error", "/not-found", "/page-not-found"]
+    
     def __init__(self, config: AEMConfig):
         self.config = config
         self.rate_limiter = AdaptiveRateLimiter(
@@ -91,6 +96,11 @@ class HTTPXEngine:
         }
         self.consecutive_failures = 0
         self._abort_scan = False
+        self._abort_message_printed = False
+        # Soft 404 fingerprints
+        self._soft_404_hash: Optional[str] = None
+        self._soft_404_length: Optional[int] = None
+        self._soft_404_calibrated = False
     
     @property
     def should_abort(self) -> bool:
@@ -112,9 +122,10 @@ class HTTPXEngine:
             # Success (2xx) or client error (4xx other than 401/403/404)
             self.consecutive_failures = 0
         
-        # Check if we should abort
-        if self.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+        # Check if we should abort (print message only once)
+        if self.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES and not self._abort_message_printed:
             self._abort_scan = True
+            self._abort_message_printed = True
             print(f"[!] ABORTING SCAN: {self.consecutive_failures} consecutive failures. Target appears unresponsive.")
     
     async def __aenter__(self):
@@ -134,6 +145,49 @@ class HTTPXEngine:
             proxy=self.config.proxy
         )
         return self
+    
+    async def calibrate_soft_404(self, base_url: str):
+        """Probe a non-existent path to fingerprint the target's soft 404 page."""
+        canary = f"/slingblade-nonexistent-{random.randint(100000,999999)}.json"
+        try:
+            response = await self.client.request(
+                "GET", f"{base_url}{canary}",
+                headers=self._generate_headers()
+            )
+            if response.status_code == 200:
+                body = response.text
+                self._soft_404_hash = hashlib.md5(body.encode(errors='replace')).hexdigest()
+                self._soft_404_length = len(body)
+                self._soft_404_calibrated = True
+                print(f"[*] Soft-404 calibrated: hash={self._soft_404_hash[:12]}... len={self._soft_404_length}")
+            else:
+                self._soft_404_calibrated = True
+                print(f"[*] Target returns {response.status_code} for non-existent paths (no soft-404)")
+        except Exception:
+            self._soft_404_calibrated = True
+    
+    def _check_soft_404(self, response_url: str, response_text: str, request_url: str) -> bool:
+        """Detect if a 200 response is actually a soft 404."""
+        # Check 1: Response URL redirected to a 404 page
+        response_url_lower = response_url.lower()
+        request_url_lower = request_url.lower()
+        if response_url_lower != request_url_lower:
+            for pattern in self.SOFT_404_URL_PATTERNS:
+                if pattern in response_url_lower:
+                    return True
+        
+        # Check 2: Response body matches calibrated soft 404 fingerprint
+        if self._soft_404_calibrated and self._soft_404_hash:
+            body_hash = hashlib.md5(response_text.encode(errors='replace')).hexdigest()
+            if body_hash == self._soft_404_hash:
+                return True
+            # Also check length similarity (within 5%) for dynamic soft 404s
+            if self._soft_404_length and self._soft_404_length > 100:
+                ratio = abs(len(response_text) - self._soft_404_length) / self._soft_404_length
+                if ratio < 0.05:
+                    return True
+        
+        return False
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
@@ -168,6 +222,18 @@ class HTTPXEngine:
         **kwargs
     ) -> ResponseWrapper:
         """Make async HTTP request with rate limiting."""
+        # Short-circuit if scan should abort
+        if self.should_abort:
+            return ResponseWrapper(
+                status_code=0,
+                headers={},
+                text="Scan aborted due to excessive failures",
+                url=url,
+                elapsed=0,
+                bypass_used=bypass,
+                technique=technique
+            )
+        
         await self.rate_limiter.acquire()
         
         request_headers = self._generate_headers(headers)
@@ -195,14 +261,20 @@ class HTTPXEngine:
             # Track consecutive failures
             self._record_request_result(response.status_code)
             
+            resp_url = str(response.url)
+            resp_text = response.text
+            soft_404 = (response.status_code == 200 and 
+                        self._check_soft_404(resp_url, resp_text, url))
+            
             return ResponseWrapper(
                 status_code=response.status_code,
                 headers=dict(response.headers),
-                text=response.text,
-                url=str(response.url),
+                text=resp_text,
+                url=resp_url,
                 elapsed=elapsed,
                 bypass_used=bypass,
-                technique=technique
+                technique=technique,
+                is_soft_404=soft_404
             )
             
         except httpx.RequestError as e:
@@ -259,7 +331,10 @@ class HTTPXEngine:
         """
         response = await self.get(url, headers=headers)
         
-        if response.status_code not in [401, 403, 404] or bypass_transformer is None:
+        # Treat soft 404 as a block
+        is_blocked = response.status_code in [401, 403, 404] or response.is_soft_404
+        
+        if not is_blocked or bypass_transformer is None:
             return response
         
         # Blocked — try bypass variants
@@ -274,7 +349,9 @@ class HTTPXEngine:
                 technique=variant.description
             )
             
-            if bypass_response.status_code == 200 and len(bypass_response.text) > 0:
+            if (bypass_response.status_code == 200 and 
+                    len(bypass_response.text) > 0 and
+                    not bypass_response.is_soft_404):
                 return bypass_response
         
         # All bypasses failed — return original response

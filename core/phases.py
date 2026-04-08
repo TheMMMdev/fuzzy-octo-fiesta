@@ -11,7 +11,7 @@ import re
 from typing import List, Dict, Set, Optional, Callable
 from dataclasses import dataclass, field
 
-from core.models import ScanPhase, Finding, VulnSeverity, TargetInfo, ServerType, AttackPath
+from core.models import ScanPhase, Finding, VulnSeverity, TargetInfo, ServerType, AttackPath, BypassTechnique
 from core.config import AEMConfig
 from core.engine import HTTPXEngine, ResponseWrapper
 from bypass.transformers import BypassTransformer, BypassResult
@@ -88,7 +88,7 @@ class Phase1Fingerprinting:
         for endpoint in self.AUTHOR_INDICATORS[:3]:
             response = await self.engine.get(f"{base_url}{endpoint}")
             
-            if response.status_code == 200:
+            if response.status_code == 200 and not response.is_soft_404:
                 self.target_info.server_type = ServerType.AUTHOR
                 return Finding(
                     phase=ScanPhase.FINGERPRINTING,
@@ -106,7 +106,7 @@ class Phase1Fingerprinting:
         
         # Check for publish indicators
         response = await self.engine.get(f"{base_url}/content.json")
-        if response.status_code == 200 and '"items":' in response.text:
+        if response.status_code == 200 and not response.is_soft_404 and '"items":' in response.text:
             self.target_info.server_type = ServerType.PUBLISH
             return Finding(
                 phase=ScanPhase.FINGERPRINTING,
@@ -143,7 +143,7 @@ class Phase1Fingerprinting:
         
         for path in test_paths:
             response = await self.engine.get(f"{base_url}{path}")
-            if response.status_code == 200:
+            if response.status_code == 200 and not response.is_soft_404:
                 allowed_selectors.append(path)
                 self.target_info.detected_paths.add(path.replace(".json", ""))
         
@@ -205,6 +205,15 @@ class Phase2Discovery:
         self.discovered_paths: Set[str] = set()
         self.blocked_paths: Set[str] = set()  # Track 403 responses
     
+    def _get_bypass_enum(self, response) -> Optional[BypassTechnique]:
+        """Convert response bypass string to BypassTechnique enum."""
+        if hasattr(response, 'bypass_used') and response.bypass_used:
+            try:
+                return BypassTechnique(response.bypass_used)
+            except ValueError:
+                pass
+        return None
+    
     async def execute(self, base_url: str, target_info: TargetInfo) -> PhaseResult:
         """Execute discovery phase."""
         print(f"[Phase 2] Contextual discovery on {base_url}")
@@ -260,7 +269,7 @@ class Phase2Discovery:
                     max_bypass_attempts=15
                 )
             
-            if response.status_code == 200:
+            if response.status_code == 200 and not response.is_soft_404:
                 try:
                     data = json.loads(response.text)
                     
@@ -275,8 +284,10 @@ class Phase2Discovery:
                             description=f"Found accessible child nodes at {path}{selector}",
                             evidence={
                                 "nodes": list(data.keys())[:20],
-                                "count": len(data)
+                                "count": len(data),
+                                "bypass_technique": getattr(response, 'bypass_used', None),
                             },
+                            bypass_used=self._get_bypass_enum(response),
                             chainable=True
                         )
                         findings.append(finding)
@@ -311,7 +322,7 @@ class Phase2Discovery:
             stat_url = f"{base_url}{stat_path}"
             response = await self.engine.get(stat_url)
             
-            if response.status_code == 200:
+            if response.status_code == 200 and not response.is_soft_404:
                 try:
                     stats = json.loads(response.text)
                     node_count = stats.get("jcr:nodeCount", 0)
@@ -329,7 +340,7 @@ class Phase2Discovery:
                         inf_url = f"{base_url}{base_path}.infinity.json"
                         inf_response = await self.engine.get(inf_url)
                         
-                        if inf_response.status_code == 200:
+                        if inf_response.status_code == 200 and not inf_response.is_soft_404:
                             findings.append(Finding(
                                 phase=ScanPhase.DISCOVERY,
                                 technique="Infinity JSON Dump",
@@ -415,7 +426,7 @@ class Phase3Exploitation:
             )
             
             # Check for successful bypass
-            if response.status_code == 200 and response.text:
+            if response.status_code == 200 and response.text and not response.is_soft_404:
                 # Verify it's not a generic error page
                 if self._is_valid_response(response):
                     findings.append(Finding(

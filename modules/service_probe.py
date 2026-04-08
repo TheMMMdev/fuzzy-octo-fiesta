@@ -12,7 +12,7 @@ import json
 import re
 from typing import List, Dict, Optional
 
-from core.models import Finding, VulnSeverity, ScanPhase
+from core.models import Finding, VulnSeverity, ScanPhase, BypassTechnique
 from core.config import AEMConfig
 from core.engine import HTTPXEngine
 from bypass.transformers import BypassTransformer
@@ -20,6 +20,15 @@ from bypass.transformers import BypassTransformer
 
 class ServiceProbeModule:
     """Deep probing for AEM-specific internal services."""
+    
+    def _get_bypass_enum(self, response) -> Optional[BypassTechnique]:
+        """Convert response bypass string to BypassTechnique enum."""
+        if response.bypass_used:
+            try:
+                return BypassTechnique(response.bypass_used)
+            except ValueError:
+                pass
+        return None
     
     # Replication agent endpoints
     REPLICATION_ENDPOINTS: List[Dict[str, str]] = [
@@ -159,7 +168,7 @@ class ServiceProbeModule:
                 max_bypass_attempts=15
             )
             
-            if response.status_code == 200 and len(response.text) > 20:
+            if response.status_code == 200 and len(response.text) > 20 and not response.is_soft_404:
                 severity = VulnSeverity.MEDIUM
                 cred_leak = False
                 
@@ -191,8 +200,9 @@ class ServiceProbeModule:
                         "response_size": len(response.text),
                         "credential_leak": cred_leak,
                         "sample": response.text[:500],
-                        "bypass_used": response.bypass_used,
+                        "bypass_technique": response.bypass_used,
                     },
+                    bypass_used=self._get_bypass_enum(response),
                     chainable=True
                 ))
         
@@ -212,7 +222,7 @@ class ServiceProbeModule:
                 max_bypass_attempts=10
             )
             
-            if response.status_code == 200 and len(response.text) > 20:
+            if response.status_code == 200 and len(response.text) > 20 and not response.is_soft_404:
                 severity = VulnSeverity.MEDIUM
                 
                 # Check for API keys / credentials
@@ -246,8 +256,9 @@ class ServiceProbeModule:
                         "response_size": len(response.text),
                         "api_keys_found": has_api_keys,
                         "sample": response.text[:500],
-                        "bypass_used": response.bypass_used,
+                        "bypass_technique": response.bypass_used,
                     },
+                    bypass_used=self._get_bypass_enum(response),
                     chainable=True
                 ))
         
@@ -267,7 +278,7 @@ class ServiceProbeModule:
                 max_bypass_attempts=10
             )
             
-            if response.status_code == 200 and len(response.text) > 20:
+            if response.status_code == 200 and len(response.text) > 20 and not response.is_soft_404:
                 severity = VulnSeverity.MEDIUM
                 
                 # Higher severity for security audits or data with user info
@@ -286,8 +297,9 @@ class ServiceProbeModule:
                         "description": endpoint["desc"],
                         "response_size": len(response.text),
                         "sample": response.text[:500],
-                        "bypass_used": response.bypass_used,
+                        "bypass_technique": response.bypass_used,
                     },
+                    bypass_used=self._get_bypass_enum(response),
                     chainable=True
                 ))
         
@@ -307,7 +319,7 @@ class ServiceProbeModule:
                 max_bypass_attempts=15
             )
             
-            if response.status_code == 200 and len(response.text) > 50:
+            if response.status_code == 200 and len(response.text) > 50 and not response.is_soft_404:
                 severity = VulnSeverity.HIGH
                 
                 # System properties or thread dumps are critical
@@ -326,8 +338,9 @@ class ServiceProbeModule:
                         "description": endpoint["desc"],
                         "response_size": len(response.text),
                         "sample": response.text[:500],
-                        "bypass_used": response.bypass_used,
+                        "bypass_technique": response.bypass_used,
                     },
+                    bypass_used=self._get_bypass_enum(response),
                     chainable=True
                 ))
         
@@ -347,7 +360,7 @@ class ServiceProbeModule:
                 max_bypass_attempts=15
             )
             
-            if response.status_code == 200 and len(response.text) > 50:
+            if response.status_code == 200 and len(response.text) > 50 and not response.is_soft_404:
                 # Try to count packages
                 pkg_count = 0
                 try:
@@ -376,8 +389,9 @@ class ServiceProbeModule:
                         "package_count": pkg_count,
                         "response_size": len(response.text),
                         "sample": response.text[:500],
-                        "bypass_used": response.bypass_used,
+                        "bypass_technique": response.bypass_used,
                     },
+                    bypass_used=self._get_bypass_enum(response),
                     chainable=True
                 ))
         

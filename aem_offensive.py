@@ -84,6 +84,9 @@ async def run_scan(target_url: str, config: AEMConfig) -> ScanResult:
     bypass = BypassTransformer()
     
     async with HTTPXEngine(config) as engine:
+        # Calibrate soft-404 detection before scanning
+        await engine.calibrate_soft_404(target_url)
+        
         # Phase Manager for discovery
         phase_manager = PhaseManager(engine, config)
         

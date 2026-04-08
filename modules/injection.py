@@ -34,32 +34,32 @@ class InjectionTestingModule:
     SSTI_PAYLOADS = [
         InjectionPayload(
             "Sling Expression EL",
-            "${7*7}",
-            "49",
+            "${91837*91837}",
+            "8433832569",
             "ssti"
         ),
         InjectionPayload(
             "HTL Expression",
-            "${3+5*2}",
-            "13",
+            "${71234+82345}",
+            "153579",
             "ssti"
         ),
         InjectionPayload(
             "Sling Scripting",
-            "<%= 3+5*2 %>",
-            "13",
+            "<%= 71234+82345 %>",
+            "153579",
             "ssti"
         ),
         InjectionPayload(
             "JSP Expression",
             "${T(java.lang.Math).PI}",
-            "3.14",
+            "3.14159",
             "ssti"
         ),
         InjectionPayload(
-            "String Concat Math",
-            "${'a'+'b'+'c'}",
-            "abc",
+            "String Concat Unique",
+            "${'zQx'+'KpL'+'mNr'}",
+            "zQxKpLmNr",
             "ssti"
         ),
         InjectionPayload(
@@ -266,6 +266,12 @@ class InjectionTestingModule:
             if self._request_count >= self._max_requests:
                 break
             
+            # Get baseline response (no payload) for differential analysis
+            async with self._semaphore:
+                baseline_url = f"{base_url}{param_base}harmless_test_string"
+                baseline_resp = await self.engine.get(baseline_url)
+                self._request_count += 1
+            
             # Limit to first 3 payloads instead of all 6
             for payload in self.SSTI_PAYLOADS[:3]:
                 if self._request_count >= self._max_requests:
@@ -277,7 +283,13 @@ class InjectionTestingModule:
                     response = await self.engine.get(url)
                     self._request_count += 1
                 
-                if payload.indicator in response.text:
+                if response.is_soft_404:
+                    continue
+                
+                # Differential check: indicator must be in payload response
+                # but NOT in the baseline response (proves evaluation happened)
+                if (payload.indicator in response.text and 
+                        payload.indicator not in baseline_resp.text):
                     findings.append(Finding(
                         phase=ScanPhase.EXPLOITATION,
                         technique="SSTI Detection",
@@ -361,7 +373,7 @@ class InjectionTestingModule:
                 response = await self.engine.get(url)
                 self._request_count += 1
             
-            if response.status_code == 200:
+            if response.status_code == 200 and not response.is_soft_404:
                 urls_found = re.findall(r'https?://[^\s\'"<>]+', response.text)
                 
                 if urls_found:
@@ -444,7 +456,9 @@ class InjectionTestingModule:
                 response = await self.engine.get(url)
                 self._request_count += 1
             
-            if payload.indicator in response.text:
+            if (not response.is_soft_404 and 
+                    response.status_code == 200 and
+                    payload.indicator in response.text):
                 findings.append(Finding(
                     phase=ScanPhase.EXPLOITATION,
                     technique="LFI via Sling Selectors",
@@ -478,7 +492,7 @@ class InjectionTestingModule:
                 response = await self.engine.get(url)
                 self._request_count += 1
             
-            if "root:x" in response.text or "web-app" in response.text:
+            if not response.is_soft_404 and ("root:x" in response.text or "web-app" in response.text):
                 findings.append(Finding(
                     phase=ScanPhase.EXPLOITATION,
                     technique="LFI Path Traversal",
