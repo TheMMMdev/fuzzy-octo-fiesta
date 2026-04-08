@@ -37,6 +37,7 @@ class BypassTechnique(str, Enum):
     PATH_OVERLAP = "path_overlap"
     SLING_SUFFIX = "sling_suffix"
     JCR_CONTENT = "jcr_content"
+    QUERY_EXTENSION = "query_extension"
 
 
 class ScanPhase(str, Enum):

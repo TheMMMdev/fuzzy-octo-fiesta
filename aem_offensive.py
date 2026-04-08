@@ -114,7 +114,7 @@ async def run_scan(target_url: str, config: AEMConfig) -> ScanResult:
             # JCR Probing Module
             if config.enable_jcr_probe and not engine.should_abort:
                 task = progress.add_task("[green]Probing JCR resources...", total=None)
-                jcr_module = JCRProbingModule(engine, config)
+                jcr_module = JCRProbingModule(engine, config, bypass)
                 jcr_findings = await jcr_module.run(target_url)
                 result.findings.extend(jcr_findings)
                 progress.remove_task(task)

@@ -676,6 +676,7 @@ class CVESuiteModule:
         findings = []
         
         test_paths = [
+            "/.json",
             "/content",
             "/content/test",
             "/content/dam",

