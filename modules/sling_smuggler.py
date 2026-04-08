@@ -16,6 +16,7 @@ from core.models import Finding, VulnSeverity, ScanPhase, BypassTechnique
 from core.config import AEMConfig
 from core.engine import HTTPXEngine
 from bypass.transformers import BypassTransformer
+from data.wordlists import AEMWordlists
 
 
 class SlingSmuggler:
@@ -73,8 +74,8 @@ class SlingSmuggler:
         ".harray.", ".model.", ".res.", ".s7dam.",
     ]
     
-    # Key paths to test permutations on
-    TARGET_PATHS: List[str] = [
+    # High-priority paths tested first (before wordlist expansion)
+    _PRIORITY_PATHS: List[str] = [
         "/content", "/content/dam", "/etc", "/etc/cloudservices",
         "/etc/replication", "/etc/workflow", "/home/users",
         "/home/groups", "/var/audit", "/var/replication",
@@ -87,13 +88,28 @@ class SlingSmuggler:
         "/conf/global", "/content/experience-fragments",
     ]
     
+    @classmethod
+    def _build_target_paths(cls) -> List[str]:
+        """Build TARGET_PATHS from priority paths + wordlist CORE_PATHS (deduped)."""
+        seen = set()
+        merged = []
+        for p in cls._PRIORITY_PATHS:
+            if p not in seen:
+                seen.add(p)
+                merged.append(p)
+        for p in AEMWordlists.CORE_PATHS:
+            if p not in seen:
+                seen.add(p)
+                merged.append(p)
+        return merged
+    
     def __init__(self, engine: HTTPXEngine, config: AEMConfig, bypass: BypassTransformer):
         self.engine = engine
         self.config = config
         self.bypass = bypass
         self._seen_urls: Set[str] = set()
-        self._max_per_path = 15  # Reduced from 25
-        self._max_total_requests = 200  # Hard cap per phase
+        self._max_per_path = 10  # Per-path cap
+        self._max_total_requests = 600  # Increased to cover wordlist paths
         self._request_count = 0
         # Semaphore to limit concurrent requests within this module
         self._semaphore = asyncio.Semaphore(min(20, config.max_concurrent))
@@ -145,7 +161,7 @@ class SlingSmuggler:
         self._request_count = 0
         self._consecutive_failures = 0
         
-        for path in self.TARGET_PATHS:
+        for path in self._build_target_paths():
             # Early exit if we're hitting walls
             if self._consecutive_failures >= self._max_consecutive_failures:
                 print(f"[Sling Smuggler] Too many consecutive failures, skipping remaining paths")
@@ -218,7 +234,7 @@ class SlingSmuggler:
         findings = []
         self._request_count = 0
         
-        for path in self.TARGET_PATHS[:8]:  # Limit to first 8 paths
+        for path in self._build_target_paths()[:12]:  # Limit to first 12 paths
             if self._request_count >= self._max_total_requests // 2:
                 break
             
@@ -269,7 +285,7 @@ class SlingSmuggler:
         """
         findings = []
         
-        multi_segment_paths = [p for p in self.TARGET_PATHS if p.count("/") >= 2]
+        multi_segment_paths = [p for p in self._build_target_paths() if p.count("/") >= 2]
         
         for path in multi_segment_paths:
             parts = path.strip("/").split("/")
@@ -320,7 +336,7 @@ class SlingSmuggler:
         """Recursively chain selectors with strict limits."""
         findings = []
         visited: Set[str] = set()
-        queue: List[Tuple[str, int]] = [(p, 0) for p in self.TARGET_PATHS[:6]]  # Reduced from 8
+        queue: List[Tuple[str, int]] = [(p, 0) for p in self._build_target_paths()[:6]]  # Reduced from 8
         max_queue_size = 50  # Prevent unbounded growth
         requests_this_phase = 0
         max_requests = 50  # Hard limit for this phase

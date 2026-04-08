@@ -97,6 +97,9 @@ class HTTPXEngine:
         self.consecutive_failures = 0
         self._abort_scan = False
         self._abort_message_printed = False
+        # GET response cache — prevents duplicate network requests across modules
+        self._response_cache: Dict[str, ResponseWrapper] = {}
+        self._cache_hits = 0
         # Soft 404 fingerprints
         self._soft_404_hash: Optional[str] = None
         self._soft_404_length: Optional[int] = None
@@ -221,7 +224,27 @@ class HTTPXEngine:
         technique: Optional[str] = None,
         **kwargs
     ) -> ResponseWrapper:
-        """Make async HTTP request with rate limiting."""
+        """Make async HTTP request with rate limiting and GET caching."""
+        # Return cached response for duplicate GET requests
+        if method == "GET" and not kwargs:
+            cache_key = url
+            if cache_key in self._response_cache:
+                self._cache_hits += 1
+                cached = self._response_cache[cache_key]
+                # Return a copy with the caller's bypass/technique metadata
+                return ResponseWrapper(
+                    status_code=cached.status_code,
+                    headers=cached.headers,
+                    text=cached.text,
+                    url=cached.url,
+                    elapsed=cached.elapsed,
+                    bypass_used=bypass or cached.bypass_used,
+                    technique=technique or cached.technique,
+                    is_soft_404=cached.is_soft_404
+                )
+        else:
+            cache_key = None
+        
         # Short-circuit if scan should abort
         if self.should_abort:
             return ResponseWrapper(
@@ -266,7 +289,7 @@ class HTTPXEngine:
             soft_404 = (response.status_code == 200 and 
                         self._check_soft_404(resp_url, resp_text, url))
             
-            return ResponseWrapper(
+            wrapper = ResponseWrapper(
                 status_code=response.status_code,
                 headers=dict(response.headers),
                 text=resp_text,
@@ -276,6 +299,12 @@ class HTTPXEngine:
                 technique=technique,
                 is_soft_404=soft_404
             )
+            
+            # Cache GET responses for deduplication across modules
+            if cache_key is not None:
+                self._response_cache[cache_key] = wrapper
+            
+            return wrapper
             
         except httpx.RequestError as e:
             self.stats["errors"] += 1

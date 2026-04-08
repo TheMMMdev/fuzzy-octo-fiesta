@@ -45,7 +45,6 @@ class ServiceProbeModule:
         {"path": "/etc/reverse-replication-agents.1.json", "desc": "Reverse replication agents"},
         {"path": "/etc/flush-agents.1.json", "desc": "Flush agents config"},
         {"path": "/etc/static-replication-agents.1.json", "desc": "Static replication agents"},
-        {"path": "/dispatcher/invalidate.cache", "desc": "Dispatcher cache invalidation"},
     ]
     
     # Analytics / SiteCatalyst cloud service endpoints

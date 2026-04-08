@@ -170,13 +170,9 @@ class InjectionTestingModule:
         "/system/sling/logout",
     ]
     
-    # Cloud Services paths
+    # Cloud Services paths (lightweight — deep probing is in ServiceProbeModule)
     CLOUD_SERVICES_PATHS = [
-        "/etc/cloudservices.json",
-        "/etc/cloudservices/facebookconnect.json",
-        "/etc/cloudservices/twitterconnect.json",
         "/etc/cloudservices/oembed.json",
-        "/etc/cloudservices/translation.json",
     ]
     
     def __init__(self, engine: HTTPXEngine, config: AEMConfig):

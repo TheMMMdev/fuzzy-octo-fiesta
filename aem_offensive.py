@@ -190,6 +190,8 @@ async def run_scan(target_url: str, config: AEMConfig) -> ScanResult:
         "medium": sum(1 for f in result.findings if f.severity.value == "medium"),
         "low": sum(1 for f in result.findings if f.severity.value == "low"),
         "info": sum(1 for f in result.findings if f.severity.value == "info"),
+        "http_requests": engine.stats.get("total_requests", 0),
+        "cache_hits": engine._cache_hits,
     }
     
     return result
@@ -211,6 +213,11 @@ def print_results(result: ScanResult):
     table.add_row("Medium", str(result.statistics.get("medium", 0)))
     table.add_row("Low", str(result.statistics.get("low", 0)))
     table.add_row("Info", str(result.statistics.get("info", 0)))
+    
+    http_reqs = result.statistics.get("http_requests", 0)
+    cache_hits = result.statistics.get("cache_hits", 0)
+    table.add_row("HTTP Requests", str(http_reqs))
+    table.add_row("Cache Hits (dedup)", str(cache_hits))
     
     duration = (result.end_time - result.start_time).total_seconds() if result.end_time and result.start_time else 0
     table.add_row("Duration", f"{duration:.1f}s")
